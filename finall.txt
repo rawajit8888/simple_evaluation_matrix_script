@@ -484,3 +484,332 @@ print(classification_report(y_true, y_pred, zero_division=0))
 
 print("\n=== CONFUSION MATRIX (large!) ===")
 print(confusion_matrix(y_true, y_pred))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# evaluate_labelstudio_final.py
+# ================================================
+# Full evaluation script (one-shot) for Label Studio CSV
+# - Handles Label Studio taxonomy JSON in 'classification' column
+# - Auto-builds label list from CSV (no manual typing)
+# - Runs model predictions, maps IDs -> taxonomy labels
+# - Prints debug for first rows, computes metrics, saves CSV/JSON and confusion matrix image
+# - All important changes marked with "# >>> NEW CHANGE <<<"
+# ================================================
+
+import os
+import json
+import ast
+import re
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support, accuracy_score
+
+# ------------------------
+# CONFIG — MODIFY THESE
+# ------------------------
+MODEL_DIR = r"C:\path_to_your_model"            # <<< UPDATE THIS: folder with saved model
+CSV_PATH = r"C:\path_to_your_csv\your_export.csv"   # <<< UPDATE THIS: path to Label Studio CSV
+TEXT_COL = "html"          # <<< your text/email column name (you confirmed "html")
+LABEL_COL = "classification"  # <<< your label column name (Label Studio JSON string)
+SAVE_DIR = r"C:\path_to_save_results"   # <<< where results will be written
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ------------------------
+# Device
+# ------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# >>> NEW CHANGE <<< Robust extractor for Label Studio taxonomy JSON strings
+def extract_label(cell_value):
+    """
+    Parse Label Studio taxonomy JSON-like string into a readable label:
+    Examples handled:
+      '[{"taxonomy":[["Internet Banking","Account Access","Unblock"]]}]'
+      or already flattened like 'Internet Banking > Account Access > Unblock'
+    Returns a single string like: 'Internet Banking > Account Access > Unblock'
+    If parsing fails, returns "Unknown".
+    """
+    if pd.isna(cell_value):
+        return "Unknown"
+    s = str(cell_value).strip()
+    if s in ("", "[]"):
+        return "Unknown"
+
+    # If already flattened (contains >), return trimmed
+    if ">" in s and "[" not in s:
+        return s.strip()
+
+    # Try JSON first (some exports use proper JSON quoting)
+    try:
+        parsed = json.loads(s)
+        # Expect structure: [{"taxonomy":[["A","B","C"]]}]
+        if isinstance(parsed, list) and parsed:
+            first = parsed[0]
+            if "taxonomy" in first and isinstance(first["taxonomy"], list) and first["taxonomy"]:
+                tax = first["taxonomy"][0]
+                if isinstance(tax, list):
+                    return " > ".join([str(x).strip() for x in tax])
+    except Exception:
+        pass
+
+    # Try ast.literal_eval (handles Python-style lists)
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, list) and parsed:
+            first = parsed[0]
+            if isinstance(first, dict) and "taxonomy" in first:
+                taxlist = first["taxonomy"]
+                if isinstance(taxlist, list) and taxlist:
+                    first_tax = taxlist[0]
+                    if isinstance(first_tax, list):
+                        return " > ".join([str(x).strip() for x in first_tax])
+    except Exception:
+        pass
+
+    # Fallback: try to extract items between quotes or words separated by commas inside brackets
+    # e.g. [{"taxonomy":[[Internet Banking","Account Access", "Unblock"]]}]
+    try:
+        # extract text between the double quotes
+        found = re.findall(r'"([^"]+)"', s)
+        if found:
+            return " > ".join([x.strip() for x in found])
+        # fallback: words separated by commas inside brackets
+        found2 = re.findall(r'\[\s*([^\]]+)\s*\]', s)
+        if found2:
+            parts = found2[-1].split(",")
+            if len(parts) > 1:
+                return " > ".join([p.strip().strip('"').strip("'") for p in parts])
+    except Exception:
+        pass
+
+    return "Unknown"
+
+# ------------------------
+# Load CSV and preview
+# ------------------------
+print("\nLoading CSV:", CSV_PATH)
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"CSV file not found: {CSV_PATH}")
+
+df = pd.read_csv(CSV_PATH, dtype=str, keep_default_na=False)  # read as strings, avoid NaN
+print(f"Loaded rows: {len(df)}")
+print("Columns:", df.columns.tolist())
+if TEXT_COL not in df.columns or LABEL_COL not in df.columns:
+    raise ValueError(f"CSV must contain columns '{TEXT_COL}' and '{LABEL_COL}'")
+
+# >>> NEW CHANGE <<< clean text and labels
+texts = df[TEXT_COL].fillna("").astype(str).tolist()
+raw_labels = df[LABEL_COL].fillna("").astype(str).tolist()
+clean_labels = [extract_label(x) for x in raw_labels]   # >>> NEW CHANGE <<< apply extractor
+df["_clean_label"] = clean_labels                        # >>> NEW CHANGE <<< keep in df for debug/saving
+
+print("\nSample cleaned labels (first 10):")
+for i in range(min(10, len(clean_labels))):
+    print(i, ":", clean_labels[i])
+
+# ------------------------
+# Auto-build label list from CSV
+# ------------------------
+# >>> NEW CHANGE <<< Build label list automatically from the cleaned labels
+label_list = list(dict.fromkeys(clean_labels))  # preserve first-seen order (stable), do not sort
+# remove "Unknown" if it dominates and keep as last if present
+label_list = [lbl for lbl in label_list if lbl != "Unknown"] + (["Unknown"] if "Unknown" in label_list else [])
+num_labels_csv = len(label_list)
+print(f"\nAuto-extracted {num_labels_csv} unique labels from CSV (order = first-seen).")
+
+# Print a small sample of mapping
+print("Label sample (index -> label):")
+for i, lbl in enumerate(label_list[:20]):
+    print(f"{i} -> {lbl}")
+
+# ------------------------
+# Load model & tokenizer
+# ------------------------
+print("\nLoading model from:", MODEL_DIR)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+model.eval()
+model.to(device)
+print("Model loaded. Model config num_labels:", getattr(model.config, "num_labels", None))
+
+# Check model.config.id2label if present
+model_id2label = {}
+if hasattr(model.config, "id2label"):
+    try:
+        model_id2label = dict(model.config.id2label)
+    except Exception:
+        # sometimes id2label is a list-like; attempt conversion
+        try:
+            model_id2label = {int(k): v for k, v in model.config.id2label.items()}
+        except Exception:
+            model_id2label = {}
+
+print("\nModel id2label preview (first 10):")
+for k in list(model_id2label.keys())[:10]:
+    print(k, "->", model_id2label[k])
+
+# ------------------------
+# Decide mapping strategy
+# ------------------------
+# >>> NEW CHANGE <<< mapping logic:
+# 1) If model.config.id2label exists and values look like meaningful taxonomy (not 'LABEL_x'),
+#    use that mapping.
+# 2) Else, if number of labels in model equals number extracted from CSV, use CSV-extracted label_list (first-seen order).
+# 3) Else, attempt safe fallback: use CSV-extracted labels but warn user.
+use_model_id2label = False
+if model_id2label:
+    # check whether id2label values are just LABEL_0 etc.
+    sample_vals = list(model_id2label.values())
+    if all(isinstance(v, str) and v.startswith("LABEL_") for v in sample_vals):
+        use_model_id2label = False
+    else:
+        use_model_id2label = True
+
+mapping_info = {"strategy": None, "num_model_labels": getattr(model.config, "num_labels", None), "num_csv_labels": num_labels_csv}
+if use_model_id2label:
+    mapping_info["strategy"] = "use_model_id2label"
+    print("\nMapping strategy: using model.config.id2label (values look meaningful).")
+    id2label_map = {int(k): v for k, v in model_id2label.items()}
+else:
+    # try fallback: if model.num_labels matches CSV labels count, map index->csv label in first-seen order
+    model_num = getattr(model.config, "num_labels", None)
+    if model_num is not None and model_num == num_labels_csv:
+        mapping_info["strategy"] = "use_csv_label_list_order"
+        print("\nMapping strategy: model.num_labels equals number of CSV labels -> using CSV-extracted labels (first-seen order).")
+        id2label_map = {idx: label_list[idx] for idx in range(num_labels_csv)}
+    else:
+        # final fallback: still map using CSV-extracted labels (may not match training order) but warn
+        mapping_info["strategy"] = "fallback_use_csv_order_with_warning"
+        print("\nWARNING: model.config.id2label not usable and model.num_labels != number of CSV labels.")
+        print("Falling back to mapping prediction indices -> CSV-extracted labels in first-seen order.")
+        print("If results look wrong, training-label-order must be retrieved to map correctly.")
+        # ensure we can index; if model has fewer labels than CSV, truncate; if more, pad with Unknown
+        model_num = getattr(model.config, "num_labels", None) or len(label_list)
+        temp_list = label_list.copy()
+        if len(temp_list) < model_num:
+            # pad with "Unknown"
+            temp_list += ["Unknown"] * (model_num - len(temp_list))
+        id2label_map = {idx: temp_list[idx] for idx in range(model_num)}
+
+# show mapping sample
+print("\nFinal id2label_map sample (first 20):")
+for k in sorted(list(id2label_map.keys()))[:20]:
+    print(k, "->", id2label_map[k])
+
+# ------------------------
+# Run predictions (batched-safe loop) and debug-print first rows
+# ------------------------
+y_pred_ids = []
+y_pred_labels = []
+y_pred_probs = []
+
+print("\nRunning inference over dataset...")
+for idx, text in enumerate(texts):
+    # Tokenize single example (keeps memory low)
+    enc = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+    with torch.no_grad():
+        outputs = model(**enc)
+        logits = outputs.logits.detach().cpu()
+    pred_id = int(torch.argmax(logits, dim=-1).item())
+    prob = float(torch.softmax(logits, dim=-1)[0][pred_id].item())
+
+    y_pred_ids.append(pred_id)
+    mapped_label = id2label_map.get(pred_id, "Unknown")
+    y_pred_labels.append(mapped_label)
+    y_pred_probs.append(prob)
+
+    # >>> NEW CHANGE <<< debug print for first 10 rows
+    if idx < 10:
+        print("\n--- DEBUG ROW", idx, "---")
+        preview_text = text.replace("\n", " ")[:200]
+        print("Text preview:", preview_text)
+        print("y_true:", clean_labels[idx])
+        print("pred_id:", pred_id)
+        print("mapped pred label:", mapped_label)
+        print("confidence:", prob)
+
+# ------------------------
+# Save per-row results
+# ------------------------
+df["_y_pred"] = y_pred_labels     # >>> NEW CHANGE <<<
+df["_confidence"] = y_pred_probs  # >>> NEW CHANGE <<<
+out_csv = os.path.join(SAVE_DIR, "evaluation_output.csv")
+df.to_csv(out_csv, index=False)
+print(f"\nSaved per-row results to: {out_csv}")
+
+# ------------------------
+# Compute and save metrics
+# ------------------------
+print("\nComputing metrics...")
+# handle case where some y_true are "Unknown" (optionally drop them), but we will keep them
+report_dict = classification_report(clean_labels, y_pred_labels, output_dict=True, zero_division=0)
+report_text = classification_report(clean_labels, y_pred_labels, zero_division=0)
+acc = accuracy_score(clean_labels, y_pred_labels)
+prec, rec, f1, _ = precision_recall_fscore_support(clean_labels, y_pred_labels, average="weighted", zero_division=0)
+
+print("\n=== CLASSIFICATION REPORT ===")
+print(report_text)
+print(f"\nAccuracy: {acc:.4f}")
+print(f"Weighted Precision: {prec:.4f}, Weighted Recall: {rec:.4f}, Weighted F1: {f1:.4f}")
+
+# confusion matrix (can be large)
+labels_for_cm = list(dict.fromkeys(clean_labels))  # preserve order as first-seen
+cm = confusion_matrix(clean_labels, y_pred_labels, labels=labels_for_cm)
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(cm, annot=False, fmt="d", cmap="Blues", xticklabels=labels_for_cm, yticklabels=labels_for_cm)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix (rows=actual, cols=predicted)")
+cm_path = os.path.join(SAVE_DIR, "confusion_matrix.png")
+plt.tight_layout()
+plt.savefig(cm_path, dpi=150)
+plt.close()
+print(f"\nSaved confusion matrix image to: {cm_path}")
+
+# Save JSON summary
+summary = {
+    "mapping_info": mapping_info,
+    "accuracy": float(acc),
+    "weighted_precision": float(prec),
+    "weighted_recall": float(rec),
+    "weighted_f1": float(f1),
+    "num_examples": len(clean_labels),
+    "num_labels_csv": num_labels_csv,
+    "model_num_labels": getattr(model.config, "num_labels", None),
+    "sample_id2label": {k: id2label_map[k] for k in sorted(list(id2label_map.keys()))[:50]},
+    "classification_report": report_dict
+}
+summary_path = os.path.join(SAVE_DIR, "evaluation_summary.json")
+with open(summary_path, "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2, ensure_ascii=False)
+print(f"\nSaved summary JSON to: {summary_path}")
+
+print("\n✅ Evaluation finished. Inspect the CSV, JSON and confusion matrix in the save folder.")
+
