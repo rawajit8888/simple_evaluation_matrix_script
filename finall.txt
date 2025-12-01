@@ -1200,3 +1200,111 @@ print("Min pred_id:", min(y_pred_ids))
 print("Unique pred_ids:", set(y_pred_ids))
 print("Number of labels in encoder:", len(encoder.classes_))
 
+
+
+
+
+
+
+
+#last attempt
+import torch
+import torch.nn as nn
+from transformers import BertTokenizer
+import pandas as pd
+import ast
+from sklearn.metrics import classification_report
+import pickle
+
+# -----------------------------
+# 1. IMPORT YOUR MODEL CLASS
+# -----------------------------
+# NEW CHANGE: import your custom model
+from multitaskmodel import MultitaskNNModel     # <-- adjust filename if needed
+
+# -----------------------------
+# 2. Paths 
+# -----------------------------
+MODEL_DIR = "fine_tuned_model_multitask"    # your saved model folder
+ENCODER_PATH = f"{MODEL_DIR}/encoder/classification_sentiment.pkl"
+CSV_PATH = "your_exported_labelstudio.csv"
+
+# -----------------------------
+# 3. Load Tokenizer
+# -----------------------------
+tokenizer = BertTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+
+# -----------------------------
+# 4. Load Encoder (CRITICAL)
+# -----------------------------
+with open(ENCODER_PATH, "rb") as f:
+    encoder = pickle.load(f)
+
+id2label = {v: k for k, v in encoder["classification"]["encoder"].items()}
+num_labels = len(id2label)
+
+print("Loaded encoder labels:", num_labels)
+
+# -----------------------------
+# 5. Load Your Real Model
+# -----------------------------
+# NEW CHANGE: match constructor EXACTLY
+model = MultitaskNNModel(
+    modelname=MODEL_DIR,
+    classificationlabel_length=num_labels
+)
+
+# NEW CHANGE: load state dict
+state_dict = torch.load(f"{MODEL_DIR}/pytorch_model.bin", map_location="cpu")
+model.load_state_dict(state_dict, strict=False)
+model.eval()
+
+print("Model loaded with classifier head size:", model.classifier.out_features)
+
+# -----------------------------
+# 6. Load CSV and Extract y_true
+# -----------------------------
+df = pd.read_csv(CSV_PATH)
+
+def extract_label(cell_value):
+    try:
+        parsed = ast.literal_eval(cell_value)
+        taxonomy = parsed[0]["taxonomy"][0]
+        return " > ".join(taxonomy)
+    except:
+        return None
+
+df["y_true"] = df["classification"].apply(extract_label)
+df = df[df["y_true"].notna()]
+
+texts = df["html"].tolist()
+y_true = df["y_true"].tolist()
+
+print("Loaded rows:", len(texts))
+
+# -----------------------------
+# 7. Predict
+# -----------------------------
+y_pred_ids = []
+y_pred_labels = []
+
+for txt in texts:
+    inputs = tokenizer(txt, return_tensors="pt", truncation=True, padding=True, max_length=256)
+
+    with torch.no_grad():
+        bert_out = model.bert(**inputs)
+        pooled = bert_out.last_hidden_state[:,0,:]
+        logits = model.classifier(model.dropout(pooled))
+
+    pred_id = torch.argmax(logits, dim=1).item()
+    pred_label = id2label[pred_id]
+
+    y_pred_ids.append(pred_id)
+    y_pred_labels.append(pred_label)
+
+# -----------------------------
+# 8. Evaluation
+# -----------------------------
+print("\n=== Classification Report ===")
+print(classification_report(y_true, y_pred_labels))
+
