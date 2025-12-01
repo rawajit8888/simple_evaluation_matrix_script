@@ -922,3 +922,140 @@ df_eval = pd.DataFrame({
 df_eval.to_csv("evaluation_results.csv", index=False)
 print("Evaluation results saved to evaluation_results.csv")
 
+
+
+
+
+
+
+
+
+encodrs 2nd aatempt
+
+# ===============================
+# FULL EVALUATION + DEBUG SCRIPT
+# ===============================
+
+import pandas as pd
+import ast
+import pickle
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from sklearn.metrics import classification_report
+import torch
+
+# --------------------------
+# CONFIG / PATHS
+# --------------------------
+INPUT_CSV = "emails_dataset.csv"            # Label Studio exported CSV
+ENCODER_FILE = "classification_sentiment.pkl"  # ML backend encoder
+MODEL_DIR = "bert_model"                    # Trained HF model folder
+TEXT_COL = "html"                           # Column containing email/text
+LABEL_COL = "classification"                # Column containing Label Studio labels
+
+# --------------------------
+# HELPER FUNCTION
+# --------------------------
+def extract_label(cell_value):
+    """Convert Label Studio taxonomy JSON to readable string"""
+    if not cell_value or cell_value == "[]":
+        return "Unknown"
+    try:
+        parsed = ast.literal_eval(cell_value)
+        taxonomy_list = parsed[0]["taxonomy"][0]
+        label = " > ".join(taxonomy_list)
+        return label
+    except:
+        return "Unknown"
+
+# --------------------------
+# LOAD DATA
+# --------------------------
+df = pd.read_csv(INPUT_CSV)
+df["clean_label"] = df[LABEL_COL].apply(extract_label)
+texts = df[TEXT_COL].tolist()
+y_true = df["clean_label"].tolist()
+
+print(f"Loaded {len(texts)} rows")
+print(f"Unique labels in CSV: {df['clean_label'].nunique()}")
+
+# --------------------------
+# LOAD ENCODER
+# --------------------------
+with open(ENCODER_FILE, "rb") as f:
+    encoder = pickle.load(f)  # NEW: Use encoder from ML backend
+print(f"Encoder loaded: {len(encoder.classes_)} labels")
+
+# --------------------------
+# LOAD MODEL
+# --------------------------
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+model.eval()
+print(f"Model loaded: num_labels = {model.config.num_labels}")
+print(f"Model id2label preview: {model.config.id2label}")  # NEW: check model mapping
+
+# --------------------------
+# RUN PREDICTIONS
+# --------------------------
+y_pred_ids = []
+y_conf = []
+
+for i, text in enumerate(texts):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        pred_id = torch.argmax(logits, dim=-1).item()
+        confidence = torch.softmax(logits, dim=-1)[0, pred_id].item()
+
+    y_pred_ids.append(pred_id)
+    y_conf.append(confidence)
+
+    # --------------------------
+    # NEW: DEBUG FIRST 20 PREDICTIONS
+    # --------------------------
+    if i < 20:
+        print("\n--- DEBUG ROW", i, "---")
+        print(f"Text preview: {text[:50]}...")
+        print("y_true:", y_true[i])
+        print("pred_id:", pred_id)
+        mapped_label = encoder.classes_[pred_id] if pred_id < len(encoder.classes_) else "INVALID"
+        print("Mapped pred_label:", mapped_label)
+        print("Confidence:", confidence)
+        print("Logits shape:", logits.shape)
+        print("Logits:", logits)
+
+# --------------------------
+# MAP PREDICTIONS USING ENCODER
+# --------------------------
+y_pred_labels = [encoder.classes_[i] if i < len(encoder.classes_) else "INVALID" for i in y_pred_ids]
+
+# --------------------------
+# COMPUTE METRICS
+# --------------------------
+report = classification_report(y_true, y_pred_labels, zero_division=0)
+print("\n===== CLASSIFICATION REPORT =====")
+print(report)
+
+# --------------------------
+# SAVE RESULTS
+# --------------------------
+df_eval = pd.DataFrame({
+    "text": texts,
+    "y_true": y_true,
+    "y_pred": y_pred_labels,
+    "confidence": y_conf
+})
+
+df_eval.to_csv("evaluation_results.csv", index=False)
+print("Evaluation results saved to evaluation_results.csv")
+
+# --------------------------
+# SUMMARY STATS
+# --------------------------
+print("\n--- SUMMARY ---")
+print("Max pred_id:", max(y_pred_ids))
+print("Min pred_id:", min(y_pred_ids))
+print("Unique pred_ids:", set(y_pred_ids))
+print("Number of labels in encoder:", len(encoder.classes_))
+
