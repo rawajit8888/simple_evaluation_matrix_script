@@ -1,5 +1,5 @@
 # ============================================================
-# FULL EVALUATION SCRIPT WITH ULTRA-ROBUST TAXONOMY PARSING
+# FULL EVALUATION SCRIPT (FINAL FIXED VERSION)
 # ============================================================
 
 import pandas as pd
@@ -14,12 +14,12 @@ import ast
 import re
 
 # ============================================================
-# 1. CONFIG — CHANGE THESE ONLY
+# 1. CONFIG
 # ============================================================
-CSV_FILE = "your_data.csv"                     # exported from Label Studio
-TEXT_COLUMN = "Subject"                        # your text column
-LABEL_COLUMN = "classification"                # exported label column
-MODEL_DIR = "path_to_trained_model"            # your model folder
+CSV_FILE = "your_data.csv"
+TEXT_COLUMN = "Subject"
+LABEL_COLUMN = "classification"
+MODEL_DIR = "path_to_trained_model"
 ENCODER_FILE = "encoders/classification.labels.pkl"
 BATCH_SIZE = 16
 
@@ -29,58 +29,41 @@ BATCH_SIZE = 16
 with open(ENCODER_FILE, "rb") as f:
     label_encoder = pickle.load(f)
 
+classes = list(label_encoder.classes_)
+print("Original classes:", len(classes))
+
+# --- ADD UNKNOWN IF MISSING ---
+if "Unknown" not in classes:
+    print("Adding 'Unknown' label to encoder...")
+    classes.append("Unknown")
+    label_encoder.classes_ = np.array(classes)
+
 num_labels = len(label_encoder.classes_)
-print("Number of categories:", num_labels)
-print("Example classes:", label_encoder.classes_[:5])
+print("Updated classes:", num_labels)
 
 # ============================================================
-# 3. ULTRA-ROBUST TAXONOMY FIXER
+# 3. ULTRA ROBUST TAXONOMY PARSER
 # ============================================================
 
-def fix_taxonomy(raw):
+def extract_label(cell_value):
     """
-    Fixes Label Studio taxonomy strings in ANY format:
-    - valid JSON
-    - python dict format with single quotes
-    - corrupted CSV exports with extra brackets
-    - partial broken endings
+    Safely extracts taxonomy -> 'A > B > C'
+    Returns 'Unknown' for corrupt, missing, or inconsistent values.
     """
+    if not isinstance(cell_value, str) or cell_value.strip() == "" or cell_value == "[]":
+        return "Unknown"
 
-    if pd.isna(raw):
-        return None
-
-    text = str(raw).strip()
-
-    # Remove trailing garbage like: ]]]}},,,,
-    text = re.sub(r'[\]\}\s]+$', '', text)
-    text = text + "}" if not text.endswith("}") else text
-
-    # 1. JSON load attempt
     try:
-        data = json.loads(text)
-        cats = data["taxonomy"][0]
-        return " > ".join(cats)
-    except:
-        pass
+        parsed = ast.literal_eval(cell_value)
+        taxonomy = parsed[0]["taxonomy"][0]
+        label = " > ".join(taxonomy)
 
-    # 2. Python dict load attempt
-    try:
-        data = ast.literal_eval(text)
-        cats = data["taxonomy"][0]
-        return " > ".join(cats)
+        if label.strip() == "":
+            return "Unknown"
+        return label
+    
     except:
-        pass
-
-    # 3. Regex fallback (extract all strings between quotes)
-    try:
-        matches = re.findall(r"['\"]([^'\"]+)['\"]", raw)
-        if len(matches) >= 2:
-            return " > ".join(matches)
-    except:
-        pass
-
-    print("Could not parse taxonomy:", raw[:200])
-    return None
+        return "Unknown"
 
 # ============================================================
 # 4. LOAD CSV & FIX LABELS
@@ -88,18 +71,28 @@ def fix_taxonomy(raw):
 df = pd.read_csv(CSV_FILE)
 
 print("\nFixing taxonomy labels...")
-df["fixed_label"] = df[LABEL_COLUMN].apply(fix_taxonomy)
-
-# Drop failed rows
-df = df[df["fixed_label"].notnull()]
-
-# Convert to label IDs
-df["label_id"] = df["fixed_label"].map(lambda x: label_encoder.transform([x])[0])
-
-print("Total valid rows:", len(df))
+df["fixed_label"] = df[LABEL_COLUMN].apply(extract_label)
 
 # ============================================================
-# 5. LOAD MODEL
+# 5. SAFE TRANSFORM — NO MORE ERRORS
+# ============================================================
+
+def safe_transform(label):
+    """
+    Convert label -> ID 
+    If unseen, convert to 'Unknown'
+    """
+    if label not in label_encoder.classes_:
+        print(f"[WARNING] Unseen label found: {label} -> forcing 'Unknown'")
+        label = "Unknown"
+    return label_encoder.transform([label])[0]
+
+df["label_id"] = df["fixed_label"].apply(safe_transform)
+
+print("Total usable rows:", len(df))
+
+# ============================================================
+# 6. LOAD MODEL
 # ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForSequenceClassification.from_pretrained(
@@ -112,7 +105,7 @@ model.to(device)
 model.eval()
 
 # ============================================================
-# 6. PREPARE DATASET
+# 7. PREPARE DATA
 # ============================================================
 texts = df[TEXT_COLUMN].astype(str).tolist()
 labels = df["label_id"].tolist()
@@ -121,15 +114,20 @@ encodings = tokenizer(
     texts,
     padding=True,
     truncation=True,
-    return_tensors="pt",
-    max_length=512
+    max_length=512,
+    return_tensors="pt"
 )
 
-dataset = TensorDataset(encodings["input_ids"], encodings["attention_mask"], torch.tensor(labels))
+dataset = TensorDataset(
+    encodings["input_ids"],
+    encodings["attention_mask"],
+    torch.tensor(labels)
+)
+
 loader = DataLoader(dataset, batch_size=BATCH_SIZE)
 
 # ============================================================
-# 7. RUN INFERENCE
+# 8. RUN INFERENCE
 # ============================================================
 all_preds = []
 
@@ -143,18 +141,18 @@ with torch.no_grad():
         all_preds.extend(preds.cpu().numpy())
 
 # ============================================================
-# 8. MAP PREDICTIONS BACK TO LABELS
+# 9. MAP PREDICTIONS BACK
 # ============================================================
 df["y_pred"] = label_encoder.inverse_transform(all_preds)
 
 # ============================================================
-# 9. METRICS
+# 10. METRICS
 # ============================================================
 print("\n========== CLASSIFICATION REPORT ==========\n")
-print(classification_report(df["fixed_label"], df["y_pred"], digits=4))
+print(classification_report(df["fixed_label"], df["y_pred"], digits=4, zero_division=0))
 
 # ============================================================
-# 10. SAVE RESULTS
+# 11. SAVE RESULTS
 # ============================================================
 df.to_csv("evaluation_results.csv", index=False)
 print("\nSaved predictions to evaluation_results.csv")
