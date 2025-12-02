@@ -1,92 +1,134 @@
-import pickle
-import numpy as np
+import os
 import pandas as pd
-from sklearn.metrics import classification_report
-from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+import torch
+import pickle
+from transformers import AutoTokenizer, AutoConfig, AutoModelForSequenceClassification
+from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
 
-# ================================
-# 1. LOAD LABEL ENCODER
-# ================================
-print("Loading label encoder...")
-with open("label_encoder.pkl", "rb") as f:
-    label_encoder = pickle.load(f)
+# ---------------------------------------------------------
+# >>>>>>>>>>>>>>>> CHANGE THESE 3 PATHS <<<<<<<<<<<<<<<<<<
+# ---------------------------------------------------------
+MODEL_DIR = r"E:\Featsystems\evaluation_matrix\finetuned_multitask_model"
+ENCODER_PATH = r"E:\Featsystems\evaluation_matrix\finetuned_multitask_model\encoders\classification.labels.pkl"
+CSV_PATH = r"E:\Featsystems\evaluation_matrix\project-3-at.csv"
+TEXT_COLUMN = "html"
+LABEL_COLUMN = "classification"
+# ---------------------------------------------------------
 
-num_labels = len(label_encoder.classes_)
-print(f"Total labels in encoder: {num_labels}")
+print("\n========== LOADING CSV ==========")
+df = pd.read_csv(CSV_PATH)
+df = df[[TEXT_COLUMN, LABEL_COLUMN]].dropna()
+print(f"Loaded rows: {len(df)}")
+print("Sample labels:", df[LABEL_COLUMN].unique()[:10])
 
-# ================================
-# 2. LOAD TRAINED MODEL
-# ================================
-model_path = "models/finetuned_model"
-print(f"Loading model from: {model_path}")
+# ---------------------------------------------------------
+# LOAD LABEL ENCODER
+# ---------------------------------------------------------
+print("\n========== LOADING LABEL ENCODER ==========")
+with open(ENCODER_PATH, "rb") as f:
+    encoder = pickle.load(f)
 
-model = AutoModelForSequenceClassification.from_pretrained(model_path)
-tokenizer = AutoTokenizer.from_pretrained(model_path)
+label2id = encoder["label2id"]
+id2label = encoder["id2label"]
 
-print(f"Model loaded! num_labels = {model.num_labels}")
+print(f"Encoder detected {len(label2id)} labels")
+print("First 10 labels:", list(label2id.items())[:10])
 
-# ================================
-# 3. LOAD FULL CSV (ALL 6500 ROWS)
-# ================================
-csv_path = "data/project-3-at.csv"
-print(f"Loading evaluation CSV: {csv_path}")
+num_labels = len(label2id)
 
-df = pd.read_csv(csv_path)
-df = df[["html", "classification"]]
+# ---------------------------------------------------------
+# LOAD TRAINED MODEL (WITH CORRECT CLASSIFICATION HEAD)
+# ---------------------------------------------------------
+print("\n========== LOADING TRAINED MODEL ==========")
 
-print(f"Dataset size: {len(df)} rows")
-print(f"Unique categories in CSV: {df['classification'].nunique()}")
+config = AutoConfig.from_pretrained(MODEL_DIR)
+config.num_labels = num_labels  # force correct number of labels
+config.id2label = id2label
+config.label2id = label2id
 
-# ================================
-# 4. Encode TRUE LABELS
-# ================================
-df["label"] = label_encoder.transform(df["classification"])
-
-# Convert to HF Dataset
-dataset = Dataset.from_pandas(df)
-
-# ================================
-# 5. Tokenizer Function
-# ================================
-def tokenize(batch):
-    return tokenizer(
-        batch["html"],
-        padding="max_length",
-        truncation=True,
-        max_length=256,
-    )
-
-dataset = dataset.map(tokenize, batched=True)
-dataset = dataset.remove_columns(["html", "classification"])
-dataset = dataset.rename_column("label", "labels")
-dataset.set_format("torch")
-
-# ================================
-# 6. Run Prediction
-# ================================
-print("Running predictions on all samples...")
-
-training_args = TrainingArguments(output_dir="eval_tmp", per_device_eval_batch_size=16)
-trainer = Trainer(model=model, args=training_args)
-
-pred_output = trainer.predict(dataset)
-
-y_true = pred_output.label_ids
-y_pred = np.argmax(pred_output.predictions, axis=-1)
-
-# ================================
-# 7. Print Classification Report
-# ================================
-print("\n=============================================================")
-print("           FINAL EVALUATION REPORT (ALL 302 LABELS)")
-print("=============================================================\n")
-
-report = classification_report(
-    y_true,
-    y_pred,
-    target_names=label_encoder.classes_,
-    zero_division=0
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_DIR,
+    config=config
 )
 
-print(report)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+
+print("Model loaded:")
+print(f" - num_labels = {model.config.num_labels}")
+print(f" - id2label example = {list(model.config.id2label.items())[:5]}")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+model.eval()
+
+# ---------------------------------------------------------
+# RUN PREDICTIONS
+# ---------------------------------------------------------
+print("\n========== RUNNING PREDICTIONS ==========\n")
+
+y_true_ids = []
+y_pred_ids = []
+
+for i, row in df.iterrows():
+    text = str(row[TEXT_COLUMN])
+    true_label = row[LABEL_COLUMN]
+
+    # True label ID
+    if true_label not in label2id:
+        continue
+    y_true_ids.append(label2id[true_label])
+
+    # Tokenize
+    inputs = tokenizer(
+        text,
+        max_length=256,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        pred_id = torch.argmax(logits, dim=1).item()
+
+    y_pred_ids.append(pred_id)
+
+    # Debug first 3 rows
+    if i < 3:
+        print("--------------------------------------------------")
+        print("TEXT:", text[:200], "...")
+        print("TRUE LABEL:", true_label)
+        print("PRED LABEL:", id2label[pred_id])
+        print("LOGITS:", logits.cpu().numpy())
+
+# ---------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------
+print("\n========== RESULTS ==========\n")
+
+print("Accuracy:", accuracy_score(y_true_ids, y_pred_ids))
+
+precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+    y_true_ids, y_pred_ids, average="macro", zero_division=0
+)
+
+precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
+    y_true_ids, y_pred_ids, average="weighted", zero_division=0
+)
+
+print(f"Precision (macro):   {precision_macro:.4f}")
+print(f"Recall (macro):      {recall_macro:.4f}")
+print(f"F1 Score (macro):    {f1_macro:.4f}\n")
+
+print(f"Precision (weighted):{precision_weighted:.4f}")
+print(f"Recall (weighted):   {recall_weighted:.4f}")
+print(f"F1 Score (weighted): {f1_weighted:.4f}\n")
+
+print("\n========== FULL CLASSIFICATION REPORT ==========\n")
+print(classification_report(
+    y_true_ids,
+    y_pred_ids,
+    target_names=[id2label[i] for i in range(num_labels)],
+    zero_division=0
+))
