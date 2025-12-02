@@ -1,5 +1,5 @@
 # -------------------------------
-# Full Evaluation Script (Single Cell)
+# Full Evaluation Script (Taxonomy Fix)
 # -------------------------------
 
 import pandas as pd
@@ -9,34 +9,69 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import pickle
 from sklearn.metrics import classification_report
 from torch.nn import functional as F
+import json
 
 # -------------------------------
-# 1. Configuration - CHANGE THESE
+# 1. CONFIGURE PATHS
 # -------------------------------
-CSV_FILE = "your_data.csv"                    # Path to exported CSV
-TEXT_COLUMN = "Subject"                       # Column containing email text
-LABEL_COLUMN = "classification"              # Column containing ground truth labels
-MODEL_DIR = "path_to_trained_model"          # Folder where model is saved
-ENCODER_FILE = "encoders/classification.labels.pkl"  # Path to label encoder
+CSV_FILE = "your_data.csv"
+TEXT_COLUMN = "Subject"
+LABEL_COLUMN = "classification"
+MODEL_DIR = "path_to_trained_model"
+ENCODER_FILE = "encoders/classification.labels.pkl"
 BATCH_SIZE = 16
 
 # -------------------------------
-# 2. Load Label Encoder
+# 2. LOAD LABEL ENCODER
 # -------------------------------
 with open(ENCODER_FILE, "rb") as f:
     label_encoder = pickle.load(f)
 
 num_labels = len(label_encoder.classes_)
 print(f"Number of categories: {num_labels}")
-print("Example classes:", label_encoder.classes_[:10])
+print("Example classes:", label_encoder.classes_[:5])
 
 # -------------------------------
-# 3. Load Model and Tokenizer
+# 3. FUNCTION TO FIX TAXONOMY LABEL
+# -------------------------------
+def fix_taxonomy(raw_label):
+    """
+    Converts taxonomy JSON string into a flattened label
+    """
+    try:
+        # Convert string → dict
+        data = json.loads(raw_label)
+        
+        # Extract taxonomy array
+        taxonomy_list = data["taxonomy"][0]
+        
+        # Join with > (same style as encoder)
+        return " > ".join(taxonomy_list)
+    
+    except Exception as e:
+        print("Error parsing taxonomy:", raw_label, e)
+        return None
+
+# -------------------------------
+# 4. LOAD CSV
+# -------------------------------
+df = pd.read_csv(CSV_FILE)
+
+# Fix label format
+df["fixed_label"] = df[LABEL_COLUMN].apply(fix_taxonomy)
+
+# Drop any errors
+df = df[df["fixed_label"].notnull()]
+
+# Encode labels using encoder
+df["label_id"] = df["fixed_label"].map(lambda x: label_encoder.transform([x])[0])
+
+# -------------------------------
+# 5. LOAD MODEL
 # -------------------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_DIR,
-    num_labels=num_labels
+    MODEL_DIR, num_labels=num_labels
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,11 +79,10 @@ model.to(device)
 model.eval()
 
 # -------------------------------
-# 4. Load CSV and Prepare Dataset
+# 6. PREPARE DATASET
 # -------------------------------
-df = pd.read_csv(CSV_FILE)
 texts = df[TEXT_COLUMN].astype(str).tolist()
-labels = df[LABEL_COLUMN].map(lambda x: label_encoder.transform([x])[0]).tolist()
+labels = df["label_id"].tolist()
 
 encodings = tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
 dataset = TensorDataset(encodings['input_ids'], encodings['attention_mask'], torch.tensor(labels))
@@ -56,7 +90,7 @@ dataset = TensorDataset(encodings['input_ids'], encodings['attention_mask'], tor
 loader = DataLoader(dataset, batch_size=BATCH_SIZE)
 
 # -------------------------------
-# 5. Run Inference
+# 7. RUN INFERENCE
 # -------------------------------
 all_preds = []
 
@@ -64,24 +98,22 @@ with torch.no_grad():
     for batch in loader:
         input_ids, attention_mask, _ = [x.to(device) for x in batch]
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        preds = torch.argmax(F.softmax(logits, dim=1), dim=1)
+        preds = torch.argmax(F.softmax(outputs.logits, dim=1), dim=1)
         all_preds.extend(preds.cpu().numpy())
 
 # -------------------------------
-# 6. Map Predictions to Labels
+# 8. MAP PREDICTIONS
 # -------------------------------
 df['y_pred'] = label_encoder.inverse_transform(all_preds)
 
 # -------------------------------
-# 7. Compute Evaluation Metrics
+# 9. METRICS
 # -------------------------------
-true_labels = df[LABEL_COLUMN]
 print("\nClassification Report:\n")
-print(classification_report(true_labels, df['y_pred'], digits=4))
+print(classification_report(df['fixed_label'], df['y_pred'], digits=4))
 
 # -------------------------------
-# 8. Save Results (Optional)
+# 10. SAVE OUTPUT
 # -------------------------------
 df.to_csv("evaluation_results.csv", index=False)
-print("\nPredictions saved to evaluation_results.csv")
+print("\nSAVED → evaluation_results.csv")
