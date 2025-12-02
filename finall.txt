@@ -1,158 +1,96 @@
 import torch
 import pandas as pd
-import ast
 import pickle
-import torch.nn as nn
-from safetensors.torch import load_file
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertForSequenceClassification
+from sklearn.metrics import classification_report, accuracy_score
+from tqdm import tqdm
 
-# ============================================================
-# 1. CONFIG
-# ============================================================
-MODEL_DIR = "/content/fine_tuned_multitask"   # change if needed
-ENCODER_PATH = f"{MODEL_DIR}/encoder/classification_sentiment.pkl"
-CSV_PATH = "/content/data.csv"
+# -------------------------
+# CONFIG
+# -------------------------
+MODEL_DIR = r"E:/Featsystems/evaluatio/finetunedmultitaskmodel"
+CSV_PATH = r"E:/Featsystems/evaluatio/project-3-at.csv"
+TEXT_COL = "html"
+LABEL_COL = "classification"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ============================================================
-# 2. LOAD ENCODER
-# ============================================================
-print("\n===== LOADING ENCODER =====")
+# -------------------------
+# LOAD LABEL ENCODER
+# -------------------------
+ENCODER_PATH = MODEL_DIR + "/encoders/classification_labels.pkl"
 
 with open(ENCODER_PATH, "rb") as f:
-    encoder = pickle.load(f)
+    label_encoder: dict = pickle.load(f)
 
-print("Encoder loaded.")
-print("Encoder type:", type(encoder))
-print("Has classes_ ?", hasattr(encoder, "classes_"))
-if hasattr(encoder, "classes_"):
-    print("Number of classes:", len(encoder.classes_))
-    print("Sample first 10:", encoder.classes_[:10])
-else:
-    print("❌ ERROR: encoder has no classes_ → wrong file")
+label2id = label_encoder
+id2label = {v: k for k, v in label2id.items()}
 
+num_labels = len(label2id)
+print("Total labels in encoder:", num_labels)
 
-# ============================================================
-# 3. MODEL CLASS (MATCHES YOUR TRAINING CODE)
-# ============================================================
-class MultitaskNNModel(nn.Module):
-    def __init__(self, model_name, classification_label_length=1000, sentiment_label_length=2):
-        super(MultitaskNNModel, self).__init__()
-        print("Model init → classification labels:", classification_label_length)
-
-        # IMPORTANT: loads fine-tuned BERT weights
-        self.bert = BertModel.from_pretrained(model_name, local_files_only=True)
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(self.bert.config.hidden_size, classification_label_length)
-
-    def forward(self, input_ids, attention_mask):
-        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = out.pooler_output
-        pooled = self.dropout(pooled)
-        logits = self.classifier(pooled)
-        return logits
-
-
-# ============================================================
-# 4. LOAD MODEL + SAFETENSORS
-# ============================================================
-print("\n===== LOADING MODEL =====")
-
-tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
-
-model = MultitaskNNModel(
-    model_name=MODEL_DIR,
-    classification_label_length=len(encoder.classes_)
+# -------------------------
+# LOAD TOKENIZER
+# (Multilingual BERT tokenizer)
+# -------------------------
+tokenizer = BertTokenizer.from_pretrained(
+    MODEL_DIR,  # must read tokenizer.json + vocab.txt from fine-tuned folder
+    local_files_only=True
 )
 
-# ---- SAFE LOAD ----
-print("\nLoading model weights from model.safetensors ...")
-state_dict = load_file(f"{MODEL_DIR}/model.safetensors")
-model.load_state_dict(state_dict)
-
-model.to(DEVICE)
+# -------------------------
+# LOAD FINE-TUNED MODEL
+# (Restores correct num_labels)
+# -------------------------
+model = BertForSequenceClassification.from_pretrained(
+    MODEL_DIR,       # Loads config.json + model.safetensors
+    num_labels=num_labels,
+    id2label=id2label,
+    label2id=label2id,
+    local_files_only=True
+)
 model.eval()
 
-print("Model loaded.")
-print("Model classifier output size:", model.classifier.out_features)
+print("Model loaded successfully.")
+print("Config num_labels =", model.config.num_labels)
+print("Label preview:", list(model.config.id2label.items())[:5])
 
-
-# ============================================================
-# 5. LOAD CSV
-# ============================================================
-print("\n===== LOADING CSV =====")
+# -------------------------
+# LOAD EVALUATION CSV
+# -------------------------
 df = pd.read_csv(CSV_PATH)
-print("Rows loaded:", len(df))
-print("Columns:", df.columns.tolist())
 
+texts = df[TEXT_COL].astype(str).tolist()
+true_labels = df[LABEL_COL].astype(str).tolist()
 
-# ============================================================
-# 6. LABEL EXTRACTION
-# ============================================================
-def extract_label(cell_value):
-    try:
-        parsed = ast.literal_eval(cell_value)
-        taxonomy = parsed[0]["taxonomy"][0]
-        return " > ".join(taxonomy)
-    except:
-        return "Unknown"
+# TRUE → IDS
+true_ids = [label2id[x] for x in true_labels]
 
+pred_ids = []
 
-# ============================================================
-# 7. EVALUATION WITH FULL DEBUGGING
-# ============================================================
-correct = 0
-total = 0
-
-print("\n===== STARTING EVALUATION DEBUG MODE =====")
-
-for idx, row in df.iterrows():
-
-    text = str(row["html"])[:200]
-    y_true = extract_label(row["classification"])
-
-    inputs = tokenizer(text, return_tensors="pt", truncation=True,
-                       padding=True, max_length=256).to(DEVICE)
+# -------------------------
+# INFERENCE
+# -------------------------
+for text in tqdm(texts, desc="Running inference"):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
 
     with torch.no_grad():
-        logits = model(**inputs)
+        outputs = model(**inputs)
+        logits = outputs.logits
         pred_id = torch.argmax(logits, dim=1).item()
 
-    # ========== DEBUG ==========
-    print("\n---------------------------------------------------")
-    print(f"Row {idx}")
-    print("Text preview:", text)
-    print("y_true:", y_true)
-    print("Pred_id:", pred_id)
-    print("Logits shape:", logits.shape)
-    print("Logits:", logits.cpu().numpy())
+    pred_ids.append(pred_id)
 
-    print("\n--- ENCODER DEBUG ---")
-    print("Encoder type:", type(encoder))
-    print("Encoder classes length:", len(encoder.classes_))
+# IDS → LABELS
+pred_labels = [id2label[i] for i in pred_ids]
 
-    # Decode ID → label
-    try:
-        pred_label = encoder.inverse_transform([pred_id])[0]
-        print("Mapped Pred Label:", pred_label)
-    except Exception as e:
-        print("❌ DECODING ERROR")
-        print("Pred_id:", pred_id)
-        print("Exception:", e)
-        print("Valid index range: 0 →", len(encoder.classes_) - 1)
-        raise
+# -------------------------
+# SAVE CSV
+# -------------------------
+df["y_pred"] = pred_labels
+df.to_csv("evaluation_output.csv", index=False)
 
-    total += 1
-    if pred_label == y_true:
-        correct += 1
-
-    if idx == 20:
-        break
-
-# ============================================================
-# 8. ACCURACY
-# ============================================================
-print("\n===== FINAL ACCURACY =====")
-print(f"{correct}/{total}  =  {correct/total:.4f}")
+# -------------------------
+# METRICS
+# -------------------------
+print("\n--------- FINAL METRICS ---------\n")
+print("Accuracy:", accuracy_score(true_labels, pred_labels))
+print(classification_report(true_labels, pred_labels))
