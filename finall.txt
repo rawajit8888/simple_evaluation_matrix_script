@@ -3,13 +3,14 @@ import pandas as pd
 import ast
 import pickle
 import torch.nn as nn
+from safetensors.torch import load_file
 from transformers import BertTokenizer, BertModel
 
 # ============================================================
 # 1. CONFIG
 # ============================================================
 MODEL_DIR = "/content/fine_tuned_multitask"   # change if needed
-ENCODER_PATH = "/content/fine_tuned_multitask/encoder/classification_sentiment.pkl"
+ENCODER_PATH = f"{MODEL_DIR}/encoder/classification_sentiment.pkl"
 CSV_PATH = "/content/data.csv"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -30,17 +31,18 @@ if hasattr(encoder, "classes_"):
     print("Number of classes:", len(encoder.classes_))
     print("Sample first 10:", encoder.classes_[:10])
 else:
-    print("ERROR: encoder has no classes_ → wrong file")
+    print("❌ ERROR: encoder has no classes_ → wrong file")
 
 
 # ============================================================
-# 3. MODEL CLASS (MATCH YOUR TRAINING CODE)
+# 3. MODEL CLASS (MATCHES YOUR TRAINING CODE)
 # ============================================================
 class MultitaskNNModel(nn.Module):
     def __init__(self, model_name, classification_label_length=1000, sentiment_label_length=2):
         super(MultitaskNNModel, self).__init__()
-        print("INIT CALLED → classification labels:", classification_label_length)
+        print("Model init → classification labels:", classification_label_length)
 
+        # IMPORTANT: loads fine-tuned BERT weights
         self.bert = BertModel.from_pretrained(model_name, local_files_only=True)
         self.dropout = nn.Dropout(0.1)
         self.classifier = nn.Linear(self.bert.config.hidden_size, classification_label_length)
@@ -54,24 +56,27 @@ class MultitaskNNModel(nn.Module):
 
 
 # ============================================================
-# 4. LOAD MODEL
+# 4. LOAD MODEL + SAFETENSORS
 # ============================================================
 print("\n===== LOADING MODEL =====")
 
 tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
 
-# IMPORTANT: classification_label_length MUST match encoder
 model = MultitaskNNModel(
     model_name=MODEL_DIR,
     classification_label_length=len(encoder.classes_)
 )
 
-model.load_state_dict(torch.load(f"{MODEL_DIR}/pytorch_model.bin", map_location=DEVICE))
+# ---- SAFE LOAD ----
+print("\nLoading model weights from model.safetensors ...")
+state_dict = load_file(f"{MODEL_DIR}/model.safetensors")
+model.load_state_dict(state_dict)
+
 model.to(DEVICE)
 model.eval()
 
 print("Model loaded.")
-print("Model output classes (should match encoder):", model.classifier.out_features)
+print("Model classifier output size:", model.classifier.out_features)
 
 
 # ============================================================
@@ -84,7 +89,7 @@ print("Columns:", df.columns.tolist())
 
 
 # ============================================================
-# 6. EXTRACT LABEL FUNCTION
+# 6. LABEL EXTRACTION
 # ============================================================
 def extract_label(cell_value):
     try:
@@ -96,30 +101,26 @@ def extract_label(cell_value):
 
 
 # ============================================================
-# 7. EVALUATION LOOP WITH FULL DEBUGGING
+# 7. EVALUATION WITH FULL DEBUGGING
 # ============================================================
 correct = 0
 total = 0
 
-print("\n===== STARTING EVALUATION WITH DEBUG =====")
+print("\n===== STARTING EVALUATION DEBUG MODE =====")
 
 for idx, row in df.iterrows():
 
     text = str(row["html"])[:200]
     y_true = extract_label(row["classification"])
 
-    # Tokenize
     inputs = tokenizer(text, return_tensors="pt", truncation=True,
                        padding=True, max_length=256).to(DEVICE)
 
-    # Predict
     with torch.no_grad():
         logits = model(**inputs)
         pred_id = torch.argmax(logits, dim=1).item()
 
-    # ===========================
-    # DEBUG BLOCK
-    # ===========================
+    # ========== DEBUG ==========
     print("\n---------------------------------------------------")
     print(f"Row {idx}")
     print("Text preview:", text)
@@ -130,22 +131,17 @@ for idx, row in df.iterrows():
 
     print("\n--- ENCODER DEBUG ---")
     print("Encoder type:", type(encoder))
-    print("Has classes_:", hasattr(encoder, "classes_"))
-    if hasattr(encoder, "classes_"):
-        print("Encoder classes length:", len(encoder.classes_))
+    print("Encoder classes length:", len(encoder.classes_))
 
-    # ===========================
-    # Decode pred_id → label
-    # ===========================
+    # Decode ID → label
     try:
         pred_label = encoder.inverse_transform([pred_id])[0]
         print("Mapped Pred Label:", pred_label)
     except Exception as e:
-        print("❌ ERROR DURING DECODING")
-        print("Predicted ID:", pred_id)
+        print("❌ DECODING ERROR")
+        print("Pred_id:", pred_id)
         print("Exception:", e)
-        print("Classes count:", len(encoder.classes_))
-        print("Valid ID range: 0 →", len(encoder.classes_) - 1)
+        print("Valid index range: 0 →", len(encoder.classes_) - 1)
         raise
 
     total += 1
@@ -156,7 +152,7 @@ for idx, row in df.iterrows():
         break
 
 # ============================================================
-# 8. FINAL ACCURACY
+# 8. ACCURACY
 # ============================================================
 print("\n===== FINAL ACCURACY =====")
 print(f"{correct}/{total}  =  {correct/total:.4f}")
