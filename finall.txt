@@ -1,6 +1,6 @@
-# -------------------------------
-# Full Evaluation Script (Taxonomy Fix)
-# -------------------------------
+# ============================================================
+# FULL EVALUATION SCRIPT WITH ULTRA-ROBUST TAXONOMY PARSING
+# ============================================================
 
 import pandas as pd
 import torch
@@ -10,110 +10,151 @@ import pickle
 from sklearn.metrics import classification_report
 from torch.nn import functional as F
 import json
+import ast
+import re
 
-# -------------------------------
-# 1. CONFIGURE PATHS
-# -------------------------------
-CSV_FILE = "your_data.csv"
-TEXT_COLUMN = "Subject"
-LABEL_COLUMN = "classification"
-MODEL_DIR = "path_to_trained_model"
+# ============================================================
+# 1. CONFIG — CHANGE THESE ONLY
+# ============================================================
+CSV_FILE = "your_data.csv"                     # exported from Label Studio
+TEXT_COLUMN = "Subject"                        # your text column
+LABEL_COLUMN = "classification"                # exported label column
+MODEL_DIR = "path_to_trained_model"            # your model folder
 ENCODER_FILE = "encoders/classification.labels.pkl"
 BATCH_SIZE = 16
 
-# -------------------------------
+# ============================================================
 # 2. LOAD LABEL ENCODER
-# -------------------------------
+# ============================================================
 with open(ENCODER_FILE, "rb") as f:
     label_encoder = pickle.load(f)
 
 num_labels = len(label_encoder.classes_)
-print(f"Number of categories: {num_labels}")
+print("Number of categories:", num_labels)
 print("Example classes:", label_encoder.classes_[:5])
 
-# -------------------------------
-# 3. FUNCTION TO FIX TAXONOMY LABEL
-# -------------------------------
-def fix_taxonomy(raw_label):
+# ============================================================
+# 3. ULTRA-ROBUST TAXONOMY FIXER
+# ============================================================
+
+def fix_taxonomy(raw):
     """
-    Converts taxonomy JSON string into a flattened label
+    Fixes Label Studio taxonomy strings in ANY format:
+    - valid JSON
+    - python dict format with single quotes
+    - corrupted CSV exports with extra brackets
+    - partial broken endings
     """
-    try:
-        # Convert string → dict
-        data = json.loads(raw_label)
-        
-        # Extract taxonomy array
-        taxonomy_list = data["taxonomy"][0]
-        
-        # Join with > (same style as encoder)
-        return " > ".join(taxonomy_list)
-    
-    except Exception as e:
-        print("Error parsing taxonomy:", raw_label, e)
+
+    if pd.isna(raw):
         return None
 
-# -------------------------------
-# 4. LOAD CSV
-# -------------------------------
+    text = str(raw).strip()
+
+    # Remove trailing garbage like: ]]]}},,,,
+    text = re.sub(r'[\]\}\s]+$', '', text)
+    text = text + "}" if not text.endswith("}") else text
+
+    # 1. JSON load attempt
+    try:
+        data = json.loads(text)
+        cats = data["taxonomy"][0]
+        return " > ".join(cats)
+    except:
+        pass
+
+    # 2. Python dict load attempt
+    try:
+        data = ast.literal_eval(text)
+        cats = data["taxonomy"][0]
+        return " > ".join(cats)
+    except:
+        pass
+
+    # 3. Regex fallback (extract all strings between quotes)
+    try:
+        matches = re.findall(r"['\"]([^'\"]+)['\"]", raw)
+        if len(matches) >= 2:
+            return " > ".join(matches)
+    except:
+        pass
+
+    print("Could not parse taxonomy:", raw[:200])
+    return None
+
+# ============================================================
+# 4. LOAD CSV & FIX LABELS
+# ============================================================
 df = pd.read_csv(CSV_FILE)
 
-# Fix label format
+print("\nFixing taxonomy labels...")
 df["fixed_label"] = df[LABEL_COLUMN].apply(fix_taxonomy)
 
-# Drop any errors
+# Drop failed rows
 df = df[df["fixed_label"].notnull()]
 
-# Encode labels using encoder
+# Convert to label IDs
 df["label_id"] = df["fixed_label"].map(lambda x: label_encoder.transform([x])[0])
 
-# -------------------------------
+print("Total valid rows:", len(df))
+
+# ============================================================
 # 5. LOAD MODEL
-# -------------------------------
+# ============================================================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_DIR, num_labels=num_labels
+    MODEL_DIR,
+    num_labels=num_labels
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 model.eval()
 
-# -------------------------------
+# ============================================================
 # 6. PREPARE DATASET
-# -------------------------------
+# ============================================================
 texts = df[TEXT_COLUMN].astype(str).tolist()
 labels = df["label_id"].tolist()
 
-encodings = tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
-dataset = TensorDataset(encodings['input_ids'], encodings['attention_mask'], torch.tensor(labels))
+encodings = tokenizer(
+    texts,
+    padding=True,
+    truncation=True,
+    return_tensors="pt",
+    max_length=512
+)
 
+dataset = TensorDataset(encodings["input_ids"], encodings["attention_mask"], torch.tensor(labels))
 loader = DataLoader(dataset, batch_size=BATCH_SIZE)
 
-# -------------------------------
+# ============================================================
 # 7. RUN INFERENCE
-# -------------------------------
+# ============================================================
 all_preds = []
 
+print("\nRunning inference...")
 with torch.no_grad():
     for batch in loader:
-        input_ids, attention_mask, _ = [x.to(device) for x in batch]
+        input_ids, attention_mask, _ = [t.to(device) for t in batch]
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        preds = torch.argmax(F.softmax(outputs.logits, dim=1), dim=1)
+        probs = F.softmax(outputs.logits, dim=1)
+        preds = torch.argmax(probs, dim=1)
         all_preds.extend(preds.cpu().numpy())
 
-# -------------------------------
-# 8. MAP PREDICTIONS
-# -------------------------------
-df['y_pred'] = label_encoder.inverse_transform(all_preds)
+# ============================================================
+# 8. MAP PREDICTIONS BACK TO LABELS
+# ============================================================
+df["y_pred"] = label_encoder.inverse_transform(all_preds)
 
-# -------------------------------
+# ============================================================
 # 9. METRICS
-# -------------------------------
-print("\nClassification Report:\n")
-print(classification_report(df['fixed_label'], df['y_pred'], digits=4))
+# ============================================================
+print("\n========== CLASSIFICATION REPORT ==========\n")
+print(classification_report(df["fixed_label"], df["y_pred"], digits=4))
 
-# -------------------------------
-# 10. SAVE OUTPUT
-# -------------------------------
+# ============================================================
+# 10. SAVE RESULTS
+# ============================================================
 df.to_csv("evaluation_results.csv", index=False)
-print("\nSAVED → evaluation_results.csv")
+print("\nSaved predictions to evaluation_results.csv")
