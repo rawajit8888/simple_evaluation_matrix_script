@@ -1,129 +1,92 @@
-import pandas as pd
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import pickle
-import ast
+import numpy as np
+import pandas as pd
 from sklearn.metrics import classification_report
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 
-# ====================================================================
-# PATHS (CHANGE THESE 3 ONLY)
-# ====================================================================
+# ================================
+# 1. LOAD LABEL ENCODER
+# ================================
+print("Loading label encoder...")
+with open("label_encoder.pkl", "rb") as f:
+    label_encoder = pickle.load(f)
 
-MODEL_DIR = r"E:/Featsystems/evaluatio/finetunedmultitaskmodel"
-ENCODER_PATH = MODEL_DIR + "/encoders/classification_labels.pkl"
-CSV_PATH = r"E:/Featsystems/evaluatio/project-3-at.csv"
+num_labels = len(label_encoder.classes_)
+print(f"Total labels in encoder: {num_labels}")
 
-TEXT_COL = "html"
-LABEL_COL = "classification"
+# ================================
+# 2. LOAD TRAINED MODEL
+# ================================
+model_path = "models/finetuned_model"
+print(f"Loading model from: {model_path}")
 
-# ====================================================================
-# STEP 1: LOAD CSV + CLEAN LABELS
-# ====================================================================
+model = AutoModelForSequenceClassification.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-print("\nLoading CSV:", CSV_PATH)
-df = pd.read_csv(CSV_PATH)
+print(f"Model loaded! num_labels = {model.num_labels}")
 
-def extract_label(cell_value):
-    if not cell_value or cell_value == "[]":
-        return "Unknown"
-    try:
-        parsed = ast.literal_eval(cell_value)
-        taxonomy_list = parsed[0]["taxonomy"][0]
-        return " > ".join(taxonomy_list)
-    except:
-        return "Unknown"
+# ================================
+# 3. LOAD FULL CSV (ALL 6500 ROWS)
+# ================================
+csv_path = "data/project-3-at.csv"
+print(f"Loading evaluation CSV: {csv_path}")
 
-df["label_clean"] = df[LABEL_COL].apply(extract_label)
+df = pd.read_csv(csv_path)
+df = df[["html", "classification"]]
 
-print("\nLoaded rows:", len(df))
-print("Unique labels in CSV:", df["label_clean"].nunique())
-print("Sample cleaned labels:", df["label_clean"].head(10).tolist())
+print(f"Dataset size: {len(df)} rows")
+print(f"Unique categories in CSV: {df['classification'].nunique()}")
 
-texts = df[TEXT_COL].fillna("").tolist()
-y_true = df["label_clean"].tolist()
+# ================================
+# 4. Encode TRUE LABELS
+# ================================
+df["label"] = label_encoder.transform(df["classification"])
 
-# ====================================================================
-# STEP 2: LOAD ENCODER (UNIVERSAL FIX)
-# ====================================================================
+# Convert to HF Dataset
+dataset = Dataset.from_pandas(df)
 
-print("\nLoading encoder:", ENCODER_PATH)
-with open(ENCODER_PATH, "rb") as f:
-    enc = pickle.load(f)
-
-print("\nDEBUG ENCODER TYPE =", type(enc))
-print("RAW ENCODER =", enc)
-
-# ------ CASE 1 → LabelEncoder object ------
-if hasattr(enc, "classes_"):
-    classes = list(enc.classes_)
-    print("Detected format: sklearn LabelEncoder")
-
-# ------ CASE 2 → {'classification': LabelEncoder} ------
-elif isinstance(enc, dict) and "classification" in enc:
-    classes = list(enc["classification"].classes_)
-    print("Detected format: {'classification': LabelEncoder}")
-
-# ------ CASE 3 → {'labels': [...]} ------
-elif isinstance(enc, dict) and "labels" in enc:
-    classes = list(enc["labels"])
-    print("Detected format: {'labels': [...]}")
-
-else:
-    raise ValueError(
-        "❌ Unknown encoder format. Screenshot the encoder debug output above and send it to me."
+# ================================
+# 5. Tokenizer Function
+# ================================
+def tokenize(batch):
+    return tokenizer(
+        batch["html"],
+        padding="max_length",
+        truncation=True,
+        max_length=256,
     )
 
-print("\nEncoder loaded", len(classes), "labels.")
-print("Sample encoder labels:", classes[:10])
+dataset = dataset.map(tokenize, batched=True)
+dataset = dataset.remove_columns(["html", "classification"])
+dataset = dataset.rename_column("label", "labels")
+dataset.set_format("torch")
 
-label2id = {label: idx for idx, label in enumerate(classes)}
-id2label = {idx: label for idx, label in enumerate(classes)}
+# ================================
+# 6. Run Prediction
+# ================================
+print("Running predictions on all samples...")
 
-# ====================================================================
-# STEP 3: LOAD THE BERT MODEL (HF DEFAULT – WRONG NUM_LABELS)
-# ====================================================================
+training_args = TrainingArguments(output_dir="eval_tmp", per_device_eval_batch_size=16)
+trainer = Trainer(model=model, args=training_args)
 
-print("\nLoading model from:", MODEL_DIR)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+pred_output = trainer.predict(dataset)
 
-print("\nmodel.num_labels:", model.config.num_labels)
-print("model.id2label:", model.config.id2label)
+y_true = pred_output.label_ids
+y_pred = np.argmax(pred_output.predictions, axis=-1)
 
-print("\n⚠️ NOTE: HF model head is WRONG.")
-print("⚠️ We will only use the model for logits, and decoder using encoder file.")
+# ================================
+# 7. Print Classification Report
+# ================================
+print("\n=============================================================")
+print("           FINAL EVALUATION REPORT (ALL 302 LABELS)")
+print("=============================================================\n")
 
-# ====================================================================
-# STEP 4: RUN PREDICTIONS USING LOGITS + MANUAL DECODING
-# ====================================================================
+report = classification_report(
+    y_true,
+    y_pred,
+    target_names=label_encoder.classes_,
+    zero_division=0
+)
 
-y_pred = []
-confidences = []
-
-print("\nRunning predictions...\n")
-
-for i, text in enumerate(texts):
-    encoded = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-    with torch.no_grad():
-        outputs = model(**encoded)
-    
-    logits = outputs.logits.squeeze()
-    probs = torch.softmax(logits, dim=-1)
-
-    # ONLY TWO LOGITS EXIST
-    # We choose between 0/1
-    pred_id_raw = torch.argmax(probs).item()
-    confidence = probs[pred_id_raw].item()
-
-    # Map 0→first encoder label, 1→ second encoder label, etc.
-    # But HF head only supports 0/1 so:
-    pred_label = id2label.get(pred_id_raw, "UNKNOWN")
-
-    y_pred.append(pred_label)
-    confidences.append(confidence)
-
-    if i < 5:  # print first 5 for debugging
-        print("--------------------------------------------------")
-        print("TEXT:", text[:120], "...")
-        print("y_true:", y_true[i])
-        print("HF pred id:", pred_id_r
+print(report)
