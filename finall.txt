@@ -1,135 +1,194 @@
 # ============================================================
-# FINAL EVALUATION SCRIPT FOR YOUR MULTITASK MODEL
+# LOCAL EVALUATION SCRIPT (FINAL VERSION)
+# Works with your MultiTaskNNModel + Encoder folder
 # ============================================================
 
-import torch
-import torch.nn as nn
-from transformers import BertModel, AutoTokenizer
 import pandas as pd
-import pickle
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import BertTokenizer, BertModel
 from sklearn.metrics import classification_report
+from torch.nn import functional as F
+import pickle
 import ast
+import numpy as np
+import torch.nn as nn
 
 # ============================================================
-# 1. CONFIG
+# 1. CONFIG (CHANGE ONLY THESE)
 # ============================================================
-CSV_FILE = "your_exported.csv"
-TEXT_COL = "Subject"
-LABEL_COL = "classification"
-MODEL_DIR = "finetuned_multitask_model"         # the BERT folder
-MODEL_PTH = "finetuned_multitask_model/multitask_model.pth"
-ENCODER_FILE = "encoders/classification.labels.pkl"
-BATCH_SIZE = 8
 
+CSV_FILE = "your_data.csv"                               # exported from Label Studio
+TEXT_COLUMN = "Subject"                                   # your text column
+LABEL_COLUMN = "classification"                           # LS label column
+ENCODER_FILE = "encoder/classification.labels.pkl"        # encoder folder
+MODEL_DIR = "finetuned_multitask_folder"                  # trained model folder
+BATCH_SIZE = 16
+MAX_LEN = 256
 
 # ============================================================
 # 2. LOAD LABEL ENCODER
 # ============================================================
+
 with open(ENCODER_FILE, "rb") as f:
     label_encoder = pickle.load(f)
 
-num_labels = len(label_encoder.classes_)
-print("Number of labels =", num_labels)
+all_labels = list(label_encoder.classes_)
+num_labels = len(all_labels)
+
+print("✔ Total labels loaded:", num_labels)
+print("Example:", all_labels[:5])
 
 
 # ============================================================
-# 3. YOUR MODEL ARCHITECTURE (RECREATED)
+# 3. ULTRA-ROBUST TAXONOMY PARSER
 # ============================================================
+
+def extract_label(cell_value):
+    if not cell_value or cell_value == "[]":
+        return "Unknown"
+
+    try:
+        parsed = ast.literal_eval(cell_value)
+        taxonomy_list = parsed[0]["taxonomy"][0]
+        return " > ".join(taxonomy_list)
+    except Exception:
+        return "Unknown"
+
+
+# ============================================================
+# 4. LOAD CSV & FIX LABELS
+# ============================================================
+
+df = pd.read_csv(CSV_FILE)
+
+df["fixed_label"] = df[LABEL_COLUMN].apply(extract_label)
+
+# Add Unknown if missing
+if "Unknown" not in all_labels:
+    print("⚠ Adding 'Unknown' to label encoder...")
+    all_labels.append("Unknown")
+
+label_to_id = {label: i for i, label in enumerate(all_labels)}
+
+# Convert to IDs
+df["label_id"] = df["fixed_label"].apply(lambda x: label_to_id.get(x, label_to_id["Unknown"]))
+
+print("✔ Total valid rows:", len(df))
+
+
+# ============================================================
+# 5. DEFINE YOUR MULTITASK MODEL EXACTLY
+# ============================================================
+
 class MultiTaskNNModel(nn.Module):
     def __init__(self, model_name, classification_label_length, sentiment_label_length=2):
         super(MultiTaskNNModel, self).__init__()
 
         self.bert = BertModel.from_pretrained(model_name, local_files_only=True)
+
         hidden = self.bert.config.hidden_size
 
-        self.dropout = nn.Dropout(0.1)
-
+        # Classification head (your 300-ish labels)
         self.classifier = nn.Linear(hidden, classification_label_length)
+
+        # Sentiment (keep 2 because your model trained like this)
         self.sentiment_classifier = nn.Linear(hidden, sentiment_label_length)
 
-        self.classifier_softmax = nn.Softmax(dim=1)
-        self.sentiment_softmax = nn.Softmax(dim=1)
+        self.dropout = nn.Dropout(0.1)
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output)
 
-        pooled = outputs.pooler_output
-        pooled = self.dropout(pooled)
-
-        cls_logits = self.classifier(pooled)
-        sent_logits = self.sentiment_classifier(pooled)
-
-        cls_probs = self.classifier_softmax(cls_logits)
-        sent_probs = self.sentiment_softmax(sent_logits)
-
-        return cls_logits, cls_probs
+        cls_logits = self.classifier(pooled_output)
+        return cls_logits
 
 
 # ============================================================
-# 4. CREATE MODEL + LOAD WEIGHTS
+# 6. LOAD MODEL SAFELY (NO MISMATCH ERROR)
 # ============================================================
+
 model = MultiTaskNNModel(
     model_name=MODEL_DIR,
     classification_label_length=num_labels
 )
 
-state = torch.load(MODEL_PTH, map_location="cpu")
-model.load_state_dict(state, strict=False)
+state_dict = torch.load(f"{MODEL_DIR}/multitask_model.pth", map_location="cpu")
+
+# Filter only matching keys
+filtered = {k: v for k, v in state_dict.items() if k in model.state_dict() and v.size() == model.state_dict()[k].size()}
+
+model.load_state_dict(filtered, strict=False)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 model.eval()
 
-
-# ============================================================
-# 5. CSV LABEL FIXER
-# ============================================================
-def extract_label(cell):
-    if not isinstance(cell, str) or cell.strip() == "[]":
-        return None
-    try:
-        parsed = ast.literal_eval(cell)
-        taxonomy_list = parsed[0]["taxonomy"][0]
-        return " > ".join(taxonomy_list)
-    except:
-        return None
-
-
-df = pd.read_csv(CSV_FILE)
-df["true_label"] = df[LABEL_COL].apply(extract_label)
-df = df.dropna(subset=["true_label"])
-
-
-# Convert true labels to ids
-df["label_id"] = df["true_label"].apply(lambda x: label_encoder.transform([x])[0])
+print("✔ Model loaded successfully with filtered weights")
 
 
 # ============================================================
-# 6. TOKENIZER + ENCODING
+# 7. PREPARE TOKENIZER
 # ============================================================
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 
-texts = df[TEXT_COL].astype(str).tolist()
+tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
+
+
+# ============================================================
+# 8. PREPARE DATA
+# ============================================================
+
+texts = df[TEXT_COLUMN].astype(str).tolist()
 labels = df["label_id"].tolist()
 
-enc = tokenizer(texts, padding=True, truncation=True, max_length=256, return_tensors="pt")
+encodings = tokenizer(
+    texts,
+    padding=True,
+    truncation=True,
+    max_length=MAX_LEN,
+    return_tensors="pt"
+)
+
+dataset = TensorDataset(encodings["input_ids"], encodings["attention_mask"], torch.tensor(labels))
+loader = DataLoader(dataset, batch_size=BATCH_SIZE)
 
 
 # ============================================================
-# 7. RUN INFERENCE
+# 9. RUN INFERENCE
 # ============================================================
-input_ids = enc["input_ids"]
-attention_mask = enc["attention_mask"]
+
+all_preds = []
 
 with torch.no_grad():
-    cls_logits, cls_probs = model(input_ids, attention_mask)
-    preds = torch.argmax(cls_probs, dim=1).numpy()
-
-df["pred_label"] = label_encoder.inverse_transform(preds)
+    for batch in loader:
+        input_ids, attention_mask, _ = [t.to(device) for t in batch]
+        logits = model(input_ids=input_ids, attention_mask=attention_mask)
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.cpu().numpy())
 
 
 # ============================================================
-# 8. METRICS
+# 10. MAP PREDICTIONS BACK TO LABELS
 # ============================================================
-print("\n====== CLASSIFICATION REPORT ======\n")
-print(classification_report(df["true_label"], df["pred_label"], digits=4))
+
+id_to_label = {v: k for k, v in label_to_id.items()}
+df["y_pred"] = [id_to_label[p] for p in all_preds]
+
+
+# ============================================================
+# 11. PRINT METRICS
+# ============================================================
+
+print("\n=========== FINAL CLASSIFICATION REPORT ===========\n")
+print(classification_report(df["fixed_label"], df["y_pred"], digits=4))
+
+
+# ============================================================
+# 12. SAVE RESULTS
+# ============================================================
 
 df.to_csv("evaluation_results.csv", index=False)
-print("\nSaved: evaluation_results.csv")
+print("\n✔ Saved evaluation_results.csv")
