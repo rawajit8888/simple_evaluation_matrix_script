@@ -1,0 +1,191 @@
+# ============================================================
+# MODEL DRIFT MONITORING SCRIPT
+# Works with MultiTaskNNModel + encoder folder
+# ============================================================
+
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import BertTokenizer, BertModel
+from sklearn.metrics import f1_score, accuracy_score
+from torch.nn import functional as F
+import pickle
+import ast
+import numpy as np
+from collections import Counter
+from scipy.stats import entropy
+import torch.nn as nn
+
+# ============================================================
+# 1. CONFIG
+# ============================================================
+REFERENCE_CSV = "reference_data.csv"   # old LS export
+CURRENT_CSV   = "current_data.csv"     # new LS export
+TEXT_COLUMN   = "Subject"
+LABEL_COLUMN  = "classification"
+ENCODER_FILE  = "encoder/classification.labels.pkl"
+MODEL_DIR     = "finetuned_multitask_folder"
+BATCH_SIZE    = 16
+MAX_LEN       = 256
+
+# ============================================================
+# 2. LOAD LABEL ENCODER
+# ============================================================
+with open(ENCODER_FILE, "rb") as f:
+    label_encoder = pickle.load(f)
+
+all_labels = list(label_encoder.classes_)
+num_labels = len(all_labels)
+print("✔ Labels loaded:", num_labels)
+
+label_to_id = {label: i for i, label in enumerate(all_labels)}
+id_to_label = {v: k for k, v in label_to_id.items()}
+
+# ============================================================
+# 3. TAXONOMY PARSER
+# ============================================================
+def extract_label(cell_value):
+    if not cell_value or cell_value == "[]":
+        return "Unknown"
+    try:
+        parsed = ast.literal_eval(cell_value)
+        taxonomy_list = parsed[0]["taxonomy"][0]
+        return " > ".join(taxonomy_list)
+    except Exception:
+        return "Unknown"
+
+# ============================================================
+# 4. LOAD DATA
+# ============================================================
+def load_and_process(csv_file):
+    df = pd.read_csv(csv_file)
+    df["fixed_label"] = df[LABEL_COLUMN].apply(extract_label)
+    
+    # Map unseen labels to "Unknown"
+    df["label_id"] = df["fixed_label"].apply(lambda x: label_to_id.get(x, label_to_id["Unknown"]))
+    return df
+
+ref_df = load_and_process(REFERENCE_CSV)
+cur_df = load_and_process(CURRENT_CSV)
+
+print(f"✔ Reference rows: {len(ref_df)}, Current rows: {len(cur_df)}")
+
+# ============================================================
+# 5. DEFINE MULTITASK MODEL
+# ============================================================
+class MultiTaskNNModel(nn.Module):
+    def __init__(self, model_name, classification_label_length, sentiment_label_length=2):
+        super(MultiTaskNNModel, self).__init__()
+        self.bert = BertModel.from_pretrained(model_name, local_files_only=True)
+        hidden = self.bert.config.hidden_size
+        self.classifier = nn.Linear(hidden, classification_label_length)
+        self.sentiment_classifier = nn.Linear(hidden, sentiment_label_length)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output)
+        cls_logits = self.classifier(pooled_output)
+        return cls_logits
+
+# ============================================================
+# 6. LOAD MODEL SAFELY
+# ============================================================
+model = MultiTaskNNModel(
+    model_name=MODEL_DIR,
+    classification_label_length=num_labels
+)
+
+state_dict = torch.load(f"{MODEL_DIR}/multitask_model.pth", map_location="cpu")
+filtered = {k: v for k, v in state_dict.items() if k in model.state_dict() and v.size() == model.state_dict()[k].size()}
+model.load_state_dict(filtered, strict=False)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+model.eval()
+print("✔ Model loaded successfully")
+
+tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
+
+# ============================================================
+# 7. INFERENCE FUNCTION
+# ============================================================
+def run_inference(df):
+    texts = df[TEXT_COLUMN].astype(str).tolist()
+    encodings = tokenizer(
+        texts, padding=True, truncation=True, max_length=MAX_LEN, return_tensors="pt"
+    )
+    dataset = TensorDataset(encodings["input_ids"], encodings["attention_mask"])
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE)
+    
+    all_preds = []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids, attention_mask = [t.to(device) for t in batch]
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+    df["y_pred"] = [id_to_label[p] for p in all_preds]
+    return df
+
+ref_df = run_inference(ref_df)
+cur_df = run_inference(cur_df)
+
+# ============================================================
+# 8. PERFORMANCE METRICS
+# ============================================================
+def performance_metrics(df, dataset_name="Dataset"):
+    f1 = f1_score(df["fixed_label"], df["y_pred"], average="weighted")
+    acc = accuracy_score(df["fixed_label"], df["y_pred"])
+    print(f"{dataset_name} → F1: {f1:.4f}, Accuracy: {acc:.4f}")
+    return f1, acc
+
+f1_ref, acc_ref = performance_metrics(ref_df, "Reference")
+f1_cur, acc_cur = performance_metrics(cur_df, "Current")
+
+# ============================================================
+# 9. PER-CLASS F1 DROP
+# ============================================================
+categories = list(set(ref_df["fixed_label"]))
+print("\n=== Per-class F1 drop ===")
+for cat in categories:
+    f1_r = f1_score(ref_df["fixed_label"], ref_df["y_pred"], labels=[cat], average="weighted")
+    f1_c = f1_score(cur_df["fixed_label"], cur_df["y_pred"], labels=[cat], average="weighted")
+    print(f"{cat}: F1 drop = {round(f1_r - f1_c,3)}")
+
+# ============================================================
+# 10. PREDICTION DISTRIBUTION DRIFT (KL Divergence)
+# ============================================================
+ref_dist = np.array(list(Counter(ref_df["y_pred"]).values())) / len(ref_df)
+cur_dist = np.array(list(Counter(cur_df["y_pred"]).values())) / len(cur_df)
+kl_div = entropy(cur_dist, ref_dist)
+print(f"\nPrediction distribution KL divergence: {kl_div:.4f}")
+
+# ============================================================
+# 11. NEW LABELS (CONCEPT DRIFT)
+# ============================================================
+new_labels = set(cur_df["fixed_label"].unique()) - set(ref_df["fixed_label"].unique())
+if new_labels:
+    print(f"\n⚠ New labels detected (concept drift): {new_labels}")
+    new_ratio = cur_df["fixed_label"].isin(new_labels).sum() / len(cur_df)
+    print(f"New labels ratio: {new_ratio:.2%}")
+
+# ============================================================
+# 12. FINAL DECISION
+# ============================================================
+print("\n=== MODEL DRIFT DECISION ===")
+if new_labels:
+    print("🔴 Concept drift → retraining required")
+elif (f1_ref - f1_cur) > 0.05:
+    print("🟠 Performance drift → partial retraining / monitoring")
+elif kl_div > 0.05:
+    print("🟠 Prediction distribution drift → monitor / investigate")
+else:
+    print("🟢 Model stable")
+
+# ============================================================
+# 13. SAVE RESULTS
+# ============================================================
+cur_df.to_csv("model_drift_results.csv", index=False)
+print("\n✔ Saved model_drift_results.csv")
