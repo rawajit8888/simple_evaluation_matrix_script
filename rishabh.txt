@@ -1,0 +1,62 @@
+USE msdb;
+GO
+
+SELECT
+    j.job_id,
+    j.name AS Job_Name,
+    CASE j.enabled
+        WHEN 1 THEN 'Enabled'
+        ELSE 'Disabled'
+    END AS Job_Enabled,
+
+    ja.run_requested_date,
+    ja.start_execution_date,
+    ja.stop_execution_date,
+
+    CASE
+        WHEN ja.start_execution_date IS NULL THEN 'Idle'
+        WHEN ja.stop_execution_date IS NULL THEN 'Running'
+        ELSE 'Not Running'
+    END AS Current_Status,
+
+    h.run_status AS Last_Run_Status_Code,
+    CASE h.run_status
+        WHEN 0 THEN 'Failed'
+        WHEN 1 THEN 'Succeeded'
+        WHEN 2 THEN 'Retry'
+        WHEN 3 THEN 'Canceled'
+        WHEN 4 THEN 'In Progress'
+        ELSE 'Unknown'
+    END AS Last_Run_Outcome,
+
+    msdb.dbo.agent_datetime(h.run_date, h.run_time) AS Last_Run_DateTime,
+
+    sch.next_run_date,
+    sch.next_run_time,
+    msdb.dbo.agent_datetime(sch.next_run_date, sch.next_run_time) AS Next_Run_DateTime
+
+FROM msdb.dbo.sysjobs j
+
+LEFT JOIN msdb.dbo.sysjobactivity ja
+    ON j.job_id = ja.job_id
+    AND ja.session_id = (
+        SELECT MAX(session_id)
+        FROM msdb.dbo.sysjobactivity
+    )
+
+LEFT JOIN (
+    SELECT job_id, run_status, run_date, run_time,
+           ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY run_date DESC, run_time DESC) rn
+    FROM msdb.dbo.sysjobhistory
+    WHERE step_id = 0
+) h
+    ON j.job_id = h.job_id
+    AND h.rn = 1
+
+LEFT JOIN msdb.dbo.sysjobschedules js
+    ON j.job_id = js.job_id
+
+LEFT JOIN msdb.dbo.sysschedules sch
+    ON js.schedule_id = sch.schedule_id
+
+ORDER BY j.name;
