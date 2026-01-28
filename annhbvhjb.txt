@@ -199,3 +199,91 @@ def main():
 # ================= RUN =================
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import json
+import pandas as pd
+
+# ----------------------------
+# FILE PATHS
+# ----------------------------
+LS_EXPORT_JSON = "label_studio_export.json"
+WRONG_CSV = "wrong_3000.csv"
+OUTPUT_CSV = "fixed_3000.csv"
+
+# ----------------------------
+# LOAD LABEL STUDIO EXPORT
+# ----------------------------
+with open(LS_EXPORT_JSON, "r", encoding="utf-8") as f:
+    tasks = json.load(f)
+
+print(f"Loaded {len(tasks)} tasks from Label Studio export")
+
+# ----------------------------
+# BUILD MAPPING: data.ID -> task.id
+# ----------------------------
+id_mapping = {}
+
+for task in tasks:
+    data_id = task.get("data", {}).get("ID")
+
+    if data_id is None:
+        continue
+
+    data_id = str(data_id).strip()
+    task_id = task.get("id")
+
+    id_mapping[data_id] = task_id
+
+print(f"Created mapping for {len(id_mapping)} IDs")
+
+# ----------------------------
+# LOAD YOUR CSV
+# ----------------------------
+df = pd.read_csv(WRONG_CSV, dtype=str)
+
+print(f"Loaded {len(df)} rows from CSV")
+
+# ----------------------------
+# MAP CORRECT TASK ID
+# ----------------------------
+df["label_studio_task_id"] = df["ID"].map(id_mapping)
+
+# ----------------------------
+# CHECK MISSING IDS
+# ----------------------------
+missing = df["label_studio_task_id"].isna().sum()
+
+print(f"Missing task_id for {missing} rows")
+
+if missing > 0:
+    missing_rows = df[df["label_studio_task_id"].isna()]
+    missing_rows.to_csv("missing_ids.csv", index=False)
+    print("⚠ missing_ids.csv created for unmatched rows")
+
+# ----------------------------
+# SAVE FIXED CSV
+# ----------------------------
+df.to_csv(OUTPUT_CSV, index=False)
+
+print("✅ DONE")
+print("New file created:", OUTPUT_CSV)
+
