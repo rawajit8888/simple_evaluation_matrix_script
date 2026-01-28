@@ -1,0 +1,201 @@
+import os
+import json
+import time
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+from datetime import datetime
+
+# ================= LOAD ENV =================
+load_dotenv()
+
+BASE_URL = os.getenv("LABEL_STUDIO_URL").rstrip("/")
+API_KEY = os.getenv("LABEL_STUDIO_API_KEY")
+CSV_PATH = os.getenv("CSV_PATH")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+HEADERS = {
+    "Authorization": f"Token {API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# ================= AUDIT FILES =================
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+AUDIT_LOG = f"audit_update_{RUN_ID}.csv"
+PROGRESS_LOG = "processed_task_ids.txt"
+
+# ================= HTTP HELPERS =================
+def ls_get(url):
+    r = requests.get(url, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+def ls_patch(url, payload):
+    if DRY_RUN:
+        print(f"[DRY-RUN] PATCH {url}")
+        return
+    r = requests.patch(url, headers=HEADERS, json=payload)
+    r.raise_for_status()
+
+def ls_delete(url):
+    if DRY_RUN:
+        print(f"[DRY-RUN] DELETE {url}")
+        return
+    r = requests.delete(url, headers=HEADERS)
+    r.raise_for_status()
+
+def ls_post(url, payload):
+    if DRY_RUN:
+        print(f"[DRY-RUN] POST {url}")
+        print(json.dumps(payload, indent=2))
+        return
+    r = requests.post(url, headers=HEADERS, json=payload)
+    r.raise_for_status()
+
+# ================= RESUME HELPERS =================
+def load_processed_ids():
+    if not os.path.exists(PROGRESS_LOG):
+        return set()
+    with open(PROGRESS_LOG, "r") as f:
+        return set(line.strip() for line in f if line.strip())
+
+def mark_processed(task_id):
+    with open(PROGRESS_LOG, "a") as f:
+        f.write(f"{task_id}\n")
+
+# ================= AUDIT LOGGER =================
+def log_audit(task_id, status, message):
+    pd.DataFrame([{
+        "run_id": RUN_ID,
+        "task_id": task_id,
+        "status": status,
+        "message": message,
+        "timestamp": datetime.now().isoformat()
+    }]).to_csv(AUDIT_LOG, mode="a", header=False, index=False)
+
+# ================= MAIN =================
+def main():
+    print("\n================ STARTING UPDATE =================")
+    print(f"RUN ID   : {RUN_ID}")
+    print(f"DRY RUN  : {DRY_RUN}")
+    print("=================================================\n")
+
+    df = pd.read_csv(CSV_PATH)
+
+    # ---------- ADD STATUS COLUMNS ----------
+    df["update_status"] = ""
+    df["update_message"] = ""
+    df["updated_at"] = ""
+
+    processed_ids = load_processed_ids()
+
+    # ---------- INIT AUDIT LOG ----------
+    if not os.path.exists(AUDIT_LOG):
+        pd.DataFrame(columns=[
+            "run_id", "task_id", "status", "message", "timestamp"
+        ]).to_csv(AUDIT_LOG, index=False)
+
+    for idx, row in df.iterrows():
+        task_id = str(row["ID"]).strip()
+
+        if task_id in processed_ids:
+            print(f"⏭ SKIPPING already processed {task_id}")
+            df.at[idx, "update_status"] = "SKIPPED"
+            df.at[idx, "update_message"] = "Already processed"
+            df.at[idx, "updated_at"] = datetime.now().isoformat()
+            continue
+
+        print(f"\nProcessing TASK ID = {task_id}")
+
+        try:
+            # ---------- FETCH TASK ----------
+            task = ls_get(f"{BASE_URL}/api/tasks/{task_id}/")
+
+            # ---------- UPDATE TASK DATA ----------
+            data = task["data"].copy()
+            data["MasterDepartment"] = row["MasterDepartment"]
+            data["Department"] = row["Department"]
+            data["QueryType"] = row["QueryType"]
+
+            ls_patch(f"{BASE_URL}/api/tasks/{task_id}/", {"data": data})
+
+            # ---------- HANDLE ANNOTATION ----------
+            if not task.get("annotations"):
+                raise ValueError("No annotation found")
+
+            ann = task["annotations"][0]
+            ann_id = ann["id"]
+
+            classification = None
+            sentiment = None
+
+            for r in ann["result"]:
+                if r["from_name"] == "classification":
+                    classification = r
+                if r["from_name"] == "sentiment":
+                    sentiment = r
+
+            if not classification:
+                raise ValueError("No classification block found")
+
+            sub_query = classification["value"]["taxonomy"][0][3]
+
+            # ---------- DELETE OLD ----------
+            ls_delete(f"{BASE_URL}/api/annotations/{ann_id}/")
+
+            # ---------- CREATE NEW ----------
+            new_result = [{
+                "from_name": "classification",
+                "to_name": "text",
+                "type": "taxonomy",
+                "value": {
+                    "taxonomy": [[
+                        row["MasterDepartment"],
+                        row["Department"],
+                        row["QueryType"],
+                        sub_query
+                    ]]
+                }
+            }]
+
+            if sentiment:
+                new_result.append(sentiment)
+
+            payload = {
+                "completed_by": ann["completed_by"]["id"],
+                "result": new_result
+            }
+
+            ls_post(f"{BASE_URL}/api/tasks/{task_id}/annotations/", payload)
+
+            # ---------- SUCCESS ----------
+            mark_processed(task_id)
+            log_audit(task_id, "SUCCESS", "Updated successfully")
+
+            df.at[idx, "update_status"] = "SUCCESS"
+            df.at[idx, "update_message"] = "Updated successfully"
+            df.at[idx, "updated_at"] = datetime.now().isoformat()
+
+            print("   ✅ UPDATED")
+
+        except Exception as e:
+            log_audit(task_id, "FAILED", str(e))
+
+            df.at[idx, "update_status"] = "FAILED"
+            df.at[idx, "update_message"] = str(e)
+            df.at[idx, "updated_at"] = datetime.now().isoformat()
+
+            print(f"   ❌ FAILED: {e}")
+
+        time.sleep(0.2)  # rate-limit safety
+
+    # ---------- SAVE OUTPUT CSV ----------
+    output_csv = CSV_PATH.replace(".csv", "_with_status.csv")
+    df.to_csv(output_csv, index=False)
+
+    print("\n================ ALL DONE =================")
+    print(f"📄 Status file saved as: {output_csv}")
+
+# ================= RUN =================
+if __name__ == "__main__":
+    main()
