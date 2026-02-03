@@ -1,0 +1,15 @@
+You are a banking customer writing an email to the bank.
+
+Rewrite the email below in a DIFFERENT natural way while keeping the SAME meaning and SAME facts.
+
+STRICT RULES:
+- Do NOT change or invent any numbers (account number, dates, amounts, IDs).
+- Do NOT remove any important information.
+- Do NOT add new information.
+- Keep the same intent and request.
+- Use simple, professional banking email language.
+- Change sentence structure and wording as much as possible.
+- Keep the email realistic and human-written.
+
+Email:
+{email}
