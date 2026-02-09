@@ -1,0 +1,255 @@
+import os
+import logging
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from transformers import BertTokenizer, AdamW
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
+from multitask_nn_model import MultiTaskNNModel
+
+logger = logging.getLogger(__name__)
+
+
+class MultiTaskBertModel:
+
+    def __init__(self, config, logger=None):
+        self.config = config
+        self.logger = logger or logging.getLogger(__name__)
+
+        self.model_dir = self.config["MODEL_DIR"]
+        self.model_name = self.config["FINETUNED_MODEL_NAME"]
+        self.baseline_model = self.config["BASELINE_MODEL_NAME"]
+
+        self.full_model_path = os.path.join(self.model_dir, self.model_name)
+        os.makedirs(self.full_model_path, exist_ok=True)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.label_interface = None
+        self.parsed_label_config = None
+        self.processed_label_encoders = None
+        self.preload_task_data = None
+
+        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        self.model = None
+
+    # --------------------------------------------------
+    # MODEL LOAD
+    # --------------------------------------------------
+
+    def reload_model(self):
+        if self.processed_label_encoders is None:
+            self.logger.warning("Encoders not ready yet — reload skipped")
+            return
+
+        lvl1_len = len(self.processed_label_encoders["classification_lvl1"].classes_)
+        lvl2_len = len(self.processed_label_encoders["classification_lvl2"].classes_)
+        lvl3_len = len(self.processed_label_encoders["classification_lvl3"].classes_)
+        sent_len = len(self.processed_label_encoders["sentiment"].classes_)
+
+        self.model = MultiTaskNNModel(
+            "bert-base-uncased",
+            lvl1_len,
+            lvl2_len,
+            lvl3_len,
+            sent_len
+        )
+
+        model_file = os.path.join(self.full_model_path, "multitask_model.pth")
+        if os.path.exists(model_file):
+            self.logger.info("Loading saved multitask model")
+            self.model.LoadModel(self.full_model_path)
+
+        self.model.to(self.device)
+
+    # --------------------------------------------------
+    # DATA BUILD
+    # --------------------------------------------------
+
+    def _extract_labels_from_annotation(self, annotation):
+        classification_full = None
+        sentiment = None
+
+        for r in annotation["result"]:
+            if r["from_name"] == "classification":
+                classification_full = " > ".join(r["value"]["taxonomy"][0])
+            if r["from_name"] == "sentiment":
+                sentiment = r["value"]["choices"][0]
+
+        if classification_full is None or sentiment is None:
+            return None
+
+        parts = classification_full.split(" > ")
+        lvl1 = parts[0]
+        lvl2 = " > ".join(parts[:2]) if len(parts) > 1 else parts[0]
+        lvl3 = classification_full
+
+        return lvl1, lvl2, lvl3, sentiment
+
+    # --------------------------------------------------
+    # TRAIN
+    # --------------------------------------------------
+
+    def fit(self, event, data, tasks, **kwargs):
+        if self.processed_label_encoders is None:
+            raise RuntimeError("Encoders not initialized")
+
+        rows = []
+
+        for task in tasks:
+            if not task.get("annotations"):
+                continue
+
+            text = self.preload_task_data(task, task["data"]["html"])
+            ann = task["annotations"][0]
+
+            labels = self._extract_labels_from_annotation(ann)
+            if labels is None:
+                continue
+
+            lvl1, lvl2, lvl3, sent = labels
+
+            e = self.processed_label_encoders
+
+            rows.append([
+                text,
+                e["classification_lvl1"].transform([lvl1])[0],
+                e["classification_lvl2"].transform([lvl2])[0],
+                e["classification_lvl3"].transform([lvl3])[0],
+                e["sentiment"].transform([sent])[0]
+            ])
+
+        if len(rows) < 20:
+            self.logger.warning("Not enough data to train")
+            return
+
+        texts = [r[0] for r in rows]
+        lvl1_ids = np.array([r[1] for r in rows])
+        lvl2_ids = np.array([r[2] for r in rows])
+        lvl3_ids = np.array([r[3] for r in rows])
+        sent_ids = np.array([r[4] for r in rows])
+
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt"
+        )
+
+        train_idx, val_idx = train_test_split(
+            np.arange(len(texts)), test_size=0.2, random_state=42
+        )
+
+        train_data = TensorDataset(
+            enc["input_ids"][train_idx],
+            enc["attention_mask"][train_idx],
+            torch.tensor(lvl1_ids[train_idx]),
+            torch.tensor(lvl2_ids[train_idx]),
+            torch.tensor(lvl3_ids[train_idx]),
+            torch.tensor(sent_ids[train_idx])
+        )
+
+        # weighted sampler using lvl3
+        weights = compute_class_weight(
+            "balanced",
+            classes=np.unique(lvl3_ids),
+            y=lvl3_ids
+        )
+        sample_weights = weights[lvl3_ids[train_idx]]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+
+        loader = DataLoader(train_data, sampler=sampler, batch_size=16)
+
+        self.reload_model()
+        model = self.model
+        model.train()
+
+        opt = AdamW(model.parameters(), lr=2e-5)
+        loss_fn = nn.CrossEntropyLoss()
+
+        for epoch in range(5):
+            total = 0
+            for batch in loader:
+                batch = [b.to(self.device) for b in batch]
+                ids, mask, l1, l2, l3, s = batch
+
+                opt.zero_grad()
+                o1, o2, o3, os = model(ids, mask)
+
+                loss = (
+                    loss_fn(o1, l1) +
+                    loss_fn(o2, l2) +
+                    loss_fn(o3, l3) +
+                    loss_fn(os, s)
+                )
+
+                loss.backward()
+                opt.step()
+                total += loss.item()
+
+            self.logger.info(f"Epoch {epoch+1} loss {total:.3f}")
+
+        model.SaveModel(self.full_model_path)
+        self.logger.info("Model saved")
+
+    # --------------------------------------------------
+    # PREDICT
+    # --------------------------------------------------
+
+    def predict(self, tasks, texts, context, **kwargs):
+        if self.model is None:
+            self.reload_model()
+
+        self.model.eval()
+
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt"
+        ).to(self.device)
+
+        with torch.no_grad():
+            o1, o2, o3, os = self.model(enc["input_ids"], enc["attention_mask"])
+
+        p1 = torch.argmax(o1, dim=1).cpu().numpy()
+        p2 = torch.argmax(o2, dim=1).cpu().numpy()
+        p3 = torch.argmax(o3, dim=1).cpu().numpy()
+        ps = torch.argmax(os, dim=1).cpu().numpy()
+
+        e = self.processed_label_encoders
+
+        lvl3_labels = e["classification_lvl3"].inverse_transform(p3)
+        sent_labels = e["sentiment"].inverse_transform(ps)
+
+        results = []
+
+        for i, text in enumerate(texts):
+            taxonomy = lvl3_labels[i].split(" > ")
+
+            results.append({
+                "from_name": "classification",
+                "to_name": "text",
+                "type": "taxonomy",
+                "value": {
+                    "taxonomy": [taxonomy],
+                    "score": 0.95
+                }
+            })
+
+            results.append({
+                "from_name": "sentiment",
+                "to_name": "text",
+                "type": "choices",
+                "value": {
+                    "choices": [sent_labels[i]],
+                    "score": 0.95
+                }
+            })
+
+        return results

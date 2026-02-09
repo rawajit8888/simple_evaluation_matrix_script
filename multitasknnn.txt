@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+from transformers import BertModel
+
+
+class MultiTaskNNModel(nn.Module):
+
+    def __init__(
+        self,
+        modelname,
+        lvl1_classes,
+        lvl2_classes,
+        lvl3_classes,
+        sentiment_classes=2
+    ):
+        super(MultiTaskNNModel, self).__init__()
+
+        self.bert = BertModel.from_pretrained(modelname)
+
+        hidden = self.bert.config.hidden_size
+
+        self.dropout = nn.Dropout(0.1)
+
+        # ===== Hierarchical Heads =====
+        self.lvl1_classifier = nn.Linear(hidden, lvl1_classes)
+        self.lvl2_classifier = nn.Linear(hidden, lvl2_classes)
+        self.lvl3_classifier = nn.Linear(hidden, lvl3_classes)
+
+        # ===== Sentiment Head =====
+        self.sentiment_classifier = nn.Linear(hidden, sentiment_classes)
+
+    # =========================
+    # FORWARD
+    # =========================
+    def forward(self, input_ids, attention_mask):
+
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        pooled_output = outputs.pooler_output
+        pooled_output = self.dropout(pooled_output)
+
+        lvl1_logits = self.lvl1_classifier(pooled_output)
+        lvl2_logits = self.lvl2_classifier(pooled_output)
+        lvl3_logits = self.lvl3_classifier(pooled_output)
+
+        sentiment_logits = self.sentiment_classifier(pooled_output)
+
+        return {
+            "lvl1_logits": lvl1_logits,
+            "lvl2_logits": lvl2_logits,
+            "lvl3_logits": lvl3_logits,
+            "sentiment_logits": sentiment_logits
+        }
+
+    # =========================
+    # SAVE MODEL
+    # =========================
+    def SaveModel(self, directorypath):
+        self.bert.save_pretrained(directorypath)
+        torch.save(self.state_dict(), f'{directorypath}\\multitask_model.pth')
+
+    # =========================
+    # LOAD MODEL (SAFE)
+    # =========================
+    def LoadModel(self, directorypath):
+
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu'
+        )
+
+        loaded_state = torch.load(
+            f'{directorypath}\\multitask_model.pth',
+            map_location=device
+        )
+
+        current_state = self.state_dict()
+
+        # only load matching layers (important when class counts change)
+        filtered_state = {
+            k: v for k, v in loaded_state.items()
+            if k in current_state and v.size() == current_state[k].size()
+        }
+
+        current_state.update(filtered_state)
+
+        self.load_state_dict(current_state, strict=False)
+        self.eval()
