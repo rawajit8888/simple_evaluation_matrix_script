@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import label_studio_sdk
 import logging
 
-# SubQueryNNModel and DepartmentNNModel are now defined in this file (below) - no separate import needed
+# QueryTypeNNModel and DepartmentNNModel are now defined in this file (below) - no separate import needed
 
 from typing import List, Dict, Optional
 from label_studio_ml.model import LabelStudioMLBase
@@ -152,19 +152,17 @@ class DepartmentNNModel(nn.Module):
         return self.encoder
 
 
-# ========== SubQueryNNModel Class (Level 3 Model) ==========
+# ========== QueryTypeNNModel Class (Level 3 Model) ==========
 
-class SubQueryNNModel(nn.Module):
+class QueryTypeNNModel(nn.Module):
     """
     QueryType classification model with bundled label encoder.
     Level 3: Department → QueryType
     Uses same BERT backbone as MultiTask model for consistency.
-    
-    NOTE: This class is now part of multi_task_model.py (no separate file needed)
     """
     
     def __init__(self, modelname, num_labels):
-        super(SubQueryNNModel, self).__init__()
+        super(QueryTypeNNModel, self).__init__()
         
         # Use SAME backbone type as MultiTaskNNModel
         self.bert = BertModel.from_pretrained(modelname)
@@ -265,269 +263,224 @@ class SubQueryNNModel(nn.Module):
         return self.encoder
 
 
-# ========== TrainingLogger Class ==========
+# ========== MasterDepartmentModel Class (Level 1 Model) ==========
+
+class MasterDepartmentModel(nn.Module):
+    """
+    MasterDepartment classification model.
+    Level 1: Email → MasterDepartment
+    """
+    
+    def __init__(self, modelname, num_labels):
+        super(MasterDepartmentModel, self).__init__()
+        
+        self.bert = BertModel.from_pretrained(modelname)
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(
+            self.bert.config.hidden_size,
+            num_labels
+        )
+        
+        # Store encoder
+        self.encoder = None
+        
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask
+        )
+        
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output)
+        
+        logits = self.classifier(pooled_output)
+        return logits
+    
+    def set_encoder(self, encoder):
+        """Set label encoder before saving"""
+        self.encoder = encoder
+        logger.info("✓ Encoder attached to MasterDepartment model")
+    
+    def save(self, directorypath):
+        """Save model with bundled encoder"""
+        try:
+            os.makedirs(directorypath, exist_ok=True)
+            
+            # Save BERT backbone
+            logger.info(f"📦 Saving MasterDepartment BERT to {directorypath}")
+            self.bert.save_pretrained(directorypath)
+            
+            # Save classifier head
+            classifier_path = os.path.join(directorypath, "masterdepartment_classifier.pth")
+            logger.info(f"💾 Saving classifier head to {classifier_path}")
+            torch.save(
+                self.classifier.state_dict(),
+                classifier_path
+            )
+            
+            # Save bundled encoder
+            encoder_path = os.path.join(directorypath, 'masterdepartment_encoder.pkl')
+            logger.info(f"💾 Saving masterdepartment encoder to {encoder_path}")
+            with open(encoder_path, 'wb') as f:
+                pickle.dump(self.encoder, f)
+            
+            logger.info("✅ MasterDepartment model and encoder saved successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving MasterDepartment model: {e}")
+            raise
+    
+    def load(self, directorypath):
+        """Load model with bundled encoder"""
+        try:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            
+            # Reload BERT
+            logger.info(f"📂 Loading MasterDepartment BERT from {directorypath}")
+            self.bert = BertModel.from_pretrained(directorypath)
+            
+            # Reload classifier head
+            classifier_path = os.path.join(directorypath, "masterdepartment_classifier.pth")
+            logger.info(f"📂 Loading classifier head from {classifier_path}")
+            self.classifier.load_state_dict(
+                torch.load(
+                    classifier_path,
+                    map_location=device
+                )
+            )
+            
+            # Load bundled encoder
+            encoder_path = os.path.join(directorypath, 'masterdepartment_encoder.pkl')
+            if os.path.exists(encoder_path):
+                logger.info(f"📂 Loading bundled masterdepartment encoder from {encoder_path}")
+                with open(encoder_path, 'rb') as f:
+                    self.encoder = pickle.load(f)
+                logger.info("✅ MasterDepartment model and encoder loaded successfully")
+            else:
+                logger.warning("⚠️  No bundled encoder found - using external encoder")
+            
+            self.eval()
+            
+        except Exception as e:
+            logger.error(f"❌ Error loading MasterDepartment model: {e}")
+            raise
+    
+    def get_encoder(self):
+        """Safely retrieve encoder"""
+        if self.encoder is None:
+            raise ValueError("MasterDepartment encoder is None")
+        return self.encoder
+
+
+# ========== Training Progress Logger ==========
 
 class TrainingLogger:
-    """Enhanced training logger with time estimates"""
+    """Helper class for clean training progress logging"""
     
-    def __init__(self, logger, total_epochs, total_batches):
+    def __init__(self, logger, num_epochs, num_batches):
         self.logger = logger
-        self.total_epochs = total_epochs
-        self.total_batches = total_batches
+        self.num_epochs = num_epochs
+        self.num_batches = num_batches
         self.start_time = None
-        self.epoch_times = []
         
-    def start_training(self, model_name="Model"):
-        """Mark training start"""
+    def start_training(self, level_name):
         self.start_time = time.time()
-        self.logger.info("=" * 80)
-        self.logger.info(f"🚀 {model_name} TRAINING STARTED")
-        self.logger.info(f"📊 Total Epochs: {self.total_epochs}")
-        self.logger.info(f"📦 Total Batches per Epoch: {self.total_batches}")
-        self.logger.info(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.logger.info("=" * 80)
+        self.logger.info(f"📊 Total Epochs: {self.num_epochs}")
+        self.logger.info(f"📊 Batches per Epoch: {self.num_batches}")
+        self.logger.info("")
         
     def start_epoch(self, epoch):
-        """Mark epoch start"""
-        self.epoch_start = time.time()
-        self.logger.info("")
-        self.logger.info(f"📈 EPOCH {epoch + 1}/{self.total_epochs}")
-        self.logger.info("-" * 80)
+        self.logger.info(f"📅 EPOCH {epoch + 1}/{self.num_epochs}")
         
-    def log_batch(self, epoch, batch_idx, loss, **extra_losses):
-        """Log batch progress"""
-        if batch_idx % 10 == 0:  # Log every 10 batches
-            progress = (batch_idx / self.total_batches) * 100
-            loss_str = f"Loss: {loss:.4f}"
+    def log_batch(self, epoch, batch_idx, loss):
+        if (batch_idx + 1) % 10 == 0:
+            self.logger.info(f"   Batch {batch_idx + 1}/{self.num_batches} | Loss: {loss:.4f}")
             
-            # Add extra losses if provided
-            for name, value in extra_losses.items():
-                loss_str += f" | {name}: {value:.4f}"
-            
-            self.logger.info(
-                f"  Batch {batch_idx}/{self.total_batches} ({progress:.1f}%) | {loss_str}"
-            )
-    
     def end_epoch(self, epoch, avg_loss):
-        """Mark epoch end and estimate remaining time"""
-        epoch_time = time.time() - self.epoch_start
-        self.epoch_times.append(epoch_time)
+        self.logger.info(f"✓ Epoch {epoch + 1} complete | Avg Loss: {avg_loss:.4f}")
+        self.logger.info("")
         
-        # Calculate ETA
-        avg_epoch_time = np.mean(self.epoch_times)
-        remaining_epochs = self.total_epochs - (epoch + 1)
-        eta_seconds = avg_epoch_time * remaining_epochs
-        eta = timedelta(seconds=int(eta_seconds))
-        
-        self.logger.info("-" * 80)
-        self.logger.info(
-            f"✓ Epoch {epoch + 1} complete | "
-            f"Avg Loss: {avg_loss:.4f} | "
-            f"Time: {epoch_time:.2f}s | "
-            f"ETA: {eta}"
-        )
-    
     def end_training(self):
-        """Mark training end"""
-        total_time = time.time() - self.start_time
-        self.logger.info("=" * 80)
-        self.logger.info(f"🎉 TRAINING COMPLETE")
-        self.logger.info(f"⏱️  Total Time: {timedelta(seconds=int(total_time))}")
-        self.logger.info("=" * 80)
+        elapsed = time.time() - self.start_time
+        self.logger.info(f"⏱️  Total Time: {elapsed:.2f}s")
 
 
-# ========== MultiTaskBertModel Class ==========
+# ========== Main MultiTaskBertModel Class ==========
 
 class MultiTaskBertModel:
     """
-    3-Level Hierarchical Email Classification System
+    3-Level Hierarchical Classification System
     
-    Features:
-    - Level 1: Email → MasterDepartment + Sentiment
-    - Level 2: Email + MasterDepartment → Department
-    - Level 3: Email + Department → QueryType
-    - Bundled encoders (risk-free deployment)
-    - Comprehensive logging
-    - Automatic inference routing
+    Level 1: Email → MasterDepartment
+    Level 2: Email + MasterDepartment → Department  
+    Level 3: Email + MasterDepartment + Department → QueryType
+    
+    Trains 3 separate models in one training session.
     """
     
     def __init__(self, config, logger):
         self.logger = logger
         self.config = config
-        self.model_dir = config.get('MODEL_DIR', './results/bert-classification-sentiment')
-        self.baseline_model_name = config.get('BASELINE_MODEL_NAME', 'baseline-model')
-        self.finetuned_model_name = config.get('FINETUNED_MODEL_NAME', 'finetuned_multitask_model')
         
-        # Initialize models as None
-        self.model = None
-        self.department_model = None  # Level 2 model
-        self.querytype_model = None   # Level 3 model (formerly subquery_model)
-        self.tokenizer = None
+        self.baseline_model_name = config.get('BASELINE_MODEL_NAME', 'bert-base-uncased')
+        self.model_dir = pathlib.Path(config.get('MODEL_DIR', './results/bert-classification-sentiment'))
         
-        # Will be injected from model.py
+        # Initialize tokenizer once
+        self.tokenizer = AutoTokenizer.from_pretrained(self.baseline_model_name)
+        
+        # Model paths
+        self.masterdepartment_model_dir = self.model_dir / "masterdepartment_model"
+        self.department_model_dir = self.model_dir / "department_model"
+        self.querytype_model_dir = self.model_dir / "querytype_model"
+        
+        # Initialize models (will be loaded if exist)
+        self.model = None  # Level 1: MasterDepartment
+        self.department_model = None  # Level 2: Department
+        self.querytype_model = None  # Level 3: QueryType
+        
+        # Will be injected from main model.py
         self.label_interface = None
         self.processed_label_encoders = None
         self.preload_task_data = None
         
-        self.logger.info("✓ MultiTaskBertModel instance created")
-    
-    def reload_model(self):
-        """
-        Load all three models:
-        - Level 1: MasterDepartment + Sentiment
-        - Level 2: Department
-        - Level 3: QueryType
-        """
-        self.logger.info("🔄 Reloading all models...")
+        # Database for metrics
+        self.metrics_db_path = self.model_dir / "metrics.db"
         
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.logger.info(f"🖥️  Using device: {device}")
-        
-        # ========== LOAD TOKENIZER ==========
-        from transformers import AutoTokenizer
-        
-        tokenizer_path = os.path.join(self.model_dir, self.finetuned_model_name)
-        if not os.path.exists(tokenizer_path):
-            tokenizer_path = self.baseline_model_name
-            
-        self.logger.info(f"📂 Loading tokenizer from: {tokenizer_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        
-        # ========== LOAD LEVEL 1 MODEL (MasterDepartment + Sentiment) ==========
-        finetuned_path = os.path.join(self.model_dir, self.finetuned_model_name)
-        
-        if os.path.exists(finetuned_path):
-            self.logger.info(f"📂 Loading Level 1 model from: {finetuned_path}")
-            
-            # Load encoders first to get label counts
-            encoders_path = os.path.join(finetuned_path, 'label_encoders.pkl')
-            with open(encoders_path, 'rb') as f:
-                encoders = pickle.load(f)
-            
-            masterdept_encoder = encoders.get('masterdepartment')
-            sentiment_encoder = encoders.get('sentiment')
-            
-            num_masterdept = len(masterdept_encoder.classes_) if masterdept_encoder else 100
-            num_sentiment = len(sentiment_encoder.classes_) if sentiment_encoder else 2
-            
-            # Initialize model with correct dimensions
-            self.model = MultiTaskNNModel(
-                self.baseline_model_name,
-                classificationlabel_length=num_masterdept,
-                sentimentlabel_length=num_sentiment
-            )
-            
-            # Load the model
-            self.model.LoadModel(finetuned_path)
-            self.model.to(device)
-            self.model.eval()
-            
-            self.logger.info(f"✅ Level 1 model loaded | MasterDepartments: {num_masterdept} | Sentiments: {num_sentiment}")
-        else:
-            self.logger.warning(f"⚠️  Level 1 model not found at {finetuned_path}")
-        
-        # ========== LOAD LEVEL 2 MODEL (Department) ==========
-        department_path = os.path.join(self.model_dir, "department_model")
-        
-        if os.path.exists(department_path):
-            self.logger.info(f"📂 Loading Level 2 (Department) model from: {department_path}")
-            
-            # Load encoder to get label count
-            dept_encoder_path = os.path.join(department_path, 'department_encoder.pkl')
-            if os.path.exists(dept_encoder_path):
-                with open(dept_encoder_path, 'rb') as f:
-                    dept_encoder = pickle.load(f)
-                num_departments = len(dept_encoder.classes_)
-            else:
-                num_departments = 100  # default
-            
-            self.department_model = DepartmentNNModel(
-                self.baseline_model_name,
-                num_labels=num_departments
-            )
-            self.department_model.load(department_path)
-            self.department_model.to(device)
-            self.department_model.eval()
-            
-            self.logger.info(f"✅ Level 2 model loaded | Departments: {num_departments}")
-        else:
-            self.logger.warning(f"⚠️  Level 2 (Department) model not found at {department_path}")
-        
-        # ========== LOAD LEVEL 3 MODEL (QueryType) ==========
-        querytype_path = os.path.join(self.model_dir, "querytype_model")
-        
-        if os.path.exists(querytype_path):
-            self.logger.info(f"📂 Loading Level 3 (QueryType) model from: {querytype_path}")
-            
-            # Load encoder to get label count
-            qt_encoder_path = os.path.join(querytype_path, 'querytype_encoder.pkl')
-            if os.path.exists(qt_encoder_path):
-                with open(qt_encoder_path, 'rb') as f:
-                    qt_encoder = pickle.load(f)
-                num_querytypes = len(qt_encoder.classes_)
-            else:
-                num_querytypes = 100  # default
-            
-            self.querytype_model = SubQueryNNModel(
-                self.baseline_model_name,
-                num_labels=num_querytypes
-            )
-            self.querytype_model.load(querytype_path)
-            self.querytype_model.to(device)
-            self.querytype_model.eval()
-            
-            self.logger.info(f"✅ Level 3 model loaded | QueryTypes: {num_querytypes}")
-        else:
-            self.logger.warning(f"⚠️  Level 3 (QueryType) model not found at {querytype_path}")
-        
-        self.logger.info("🎉 All models reloaded successfully")
-    
-    # ========== HELPER FUNCTIONS ==========
-    
     def _get_device(self):
-        """Get available device (CUDA or CPU)"""
+        """Get available device"""
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     def _tokenize_and_pad(self, texts, tokenizer, max_len):
-        """Tokenize and pad text sequences"""
+        """Tokenize and pad texts"""
         input_ids = []
+        attention_masks = []
+        
         for text in texts:
-            encoded = tokenizer.encode(
+            encoded = tokenizer.encode_plus(
                 text,
                 add_special_tokens=True,
                 max_length=max_len,
-                truncation=True
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors='pt'
             )
-            input_ids.append(encoded)
+            
+            input_ids.append(encoded['input_ids'])
+            attention_masks.append(encoded['attention_mask'])
         
-        # Pad sequences
-        input_ids = pad_sequences(
-            input_ids,
-            maxlen=max_len,
-            dtype="long",
-            value=0,
-            truncating="post",
-            padding="post"
-        )
-        
-        # Create attention masks
-        attention_masks = []
-        for seq in input_ids:
-            mask = [int(token_id > 0) for token_id in seq]
-            attention_masks.append(mask)
+        input_ids = torch.cat(input_ids, dim=0)
+        attention_masks = torch.cat(attention_masks, dim=0)
         
         return input_ids, attention_masks
     
     def _create_dataloader(self, input_ids, attention_masks, labels=None, batch_size=16, shuffle=True):
-        """Create DataLoader from tensors"""
-        inputs = torch.tensor(input_ids)
-        masks = torch.tensor(attention_masks)
-        
+        """Create DataLoader"""
         if labels is not None:
-            labels_tensor = torch.tensor(labels)
-            dataset = TensorDataset(inputs, masks, labels_tensor)
+            labels = torch.tensor(labels)
+            dataset = TensorDataset(input_ids, attention_masks, labels)
         else:
-            dataset = TensorDataset(inputs, masks)
+            dataset = TensorDataset(input_ids, attention_masks)
         
         sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
         dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
@@ -535,42 +488,125 @@ class MultiTaskBertModel:
         return dataloader
     
     def _decode_predictions(self, predictions, task_name):
-        """Decode numerical predictions to labels"""
-        if self.model is None:
-            raise ValueError("Model not loaded")
-        
-        # Get encoder based on task
+        """Decode predictions using appropriate encoder"""
         if task_name == 'masterdepartment':
-            encoder = self.model.get_encoder('classification')
-        elif task_name == 'sentiment':
-            encoder = self.model.get_encoder('sentiment')
+            if self.model and self.model.encoder:
+                return self.model.encoder.inverse_transform(predictions)
+            elif self.processed_label_encoders:
+                encoder = self.processed_label_encoders['masterdepartment']
+                if encoder:
+                    return encoder.inverse_transform(predictions)
+        
         elif task_name == 'department':
-            if self.department_model is None:
-                raise ValueError("Department model not loaded")
-            encoder = self.department_model.get_encoder()
+            if self.department_model and self.department_model.encoder:
+                return self.department_model.encoder.inverse_transform(predictions)
+            elif self.processed_label_encoders:
+                encoder = self.processed_label_encoders['department']
+                if encoder:
+                    return encoder.inverse_transform(predictions)
+        
         elif task_name == 'querytype':
-            if self.querytype_model is None:
-                raise ValueError("QueryType model not loaded")
-            encoder = self.querytype_model.get_encoder()
-        else:
-            raise ValueError(f"Unknown task: {task_name}")
+            if self.querytype_model and self.querytype_model.encoder:
+                return self.querytype_model.encoder.inverse_transform(predictions)
+            elif self.processed_label_encoders:
+                encoder = self.processed_label_encoders['querytype']
+                if encoder:
+                    return encoder.inverse_transform(predictions)
         
-        # Convert to numpy if tensor
-        if torch.is_tensor(predictions):
-            predictions = predictions.cpu().numpy()
-        
-        # Decode
-        decoded = encoder.inverse_transform(predictions)
-        return decoded.tolist() if hasattr(decoded, 'tolist') else list(decoded)
+        return [str(p) for p in predictions]
     
-    # ========== DATABASE FUNCTIONS ==========
+    def reload_model(self):
+        """Load all three models from disk"""
+        self.logger.info("🔄 Reloading all models...")
+        
+        device = self._get_device()
+        
+        # Load Level 1: MasterDepartment
+        if self.masterdepartment_model_dir.exists():
+            try:
+                self.logger.info(f"📂 Loading Level 1 model from {self.masterdepartment_model_dir}")
+                
+                # Load encoder first to get num_labels
+                encoder_path = self.masterdepartment_model_dir / 'masterdepartment_encoder.pkl'
+                if encoder_path.exists():
+                    with open(encoder_path, 'rb') as f:
+                        encoder = pickle.load(f)
+                    num_labels = len(encoder.classes_)
+                else:
+                    self.logger.warning("⚠️  MasterDepartment encoder not found, using default")
+                    num_labels = 100
+                
+                self.model = MasterDepartmentModel(self.baseline_model_name, num_labels)
+                self.model.load(str(self.masterdepartment_model_dir))
+                self.model.to(device)
+                self.logger.info("✅ Level 1 model loaded successfully")
+            except Exception as e:
+                self.logger.warning(f"⚠️  Level 1 model not found or failed to load: {e}")
+                self.model = None
+        else:
+            self.logger.warning(f"⚠️  Level 1 model not found at {self.masterdepartment_model_dir}")
+        
+        # Load Level 2: Department
+        if self.department_model_dir.exists():
+            try:
+                self.logger.info(f"📂 Loading Level 2 model from {self.department_model_dir}")
+                
+                # Load encoder first to get num_labels
+                encoder_path = self.department_model_dir / 'department_encoder.pkl'
+                if encoder_path.exists():
+                    with open(encoder_path, 'rb') as f:
+                        encoder = pickle.load(f)
+                    num_labels = len(encoder.classes_)
+                else:
+                    self.logger.warning("⚠️  Department encoder not found, using default")
+                    num_labels = 100
+                
+                self.department_model = DepartmentNNModel(self.baseline_model_name, num_labels)
+                self.department_model.load(str(self.department_model_dir))
+                self.department_model.to(device)
+                self.logger.info("✅ Level 2 model loaded successfully")
+            except Exception as e:
+                self.logger.warning(f"⚠️  Level 2 model not found or failed to load: {e}")
+                self.department_model = None
+        else:
+            self.logger.warning(f"⚠️  Level 2 (Department) model not found at {self.department_model_dir} - will be created during training")
+        
+        # Load Level 3: QueryType
+        if self.querytype_model_dir.exists():
+            try:
+                self.logger.info(f"📂 Loading Level 3 model from {self.querytype_model_dir}")
+                
+                # Load encoder first to get num_labels
+                encoder_path = self.querytype_model_dir / 'querytype_encoder.pkl'
+                if encoder_path.exists():
+                    with open(encoder_path, 'rb') as f:
+                        encoder = pickle.load(f)
+                    num_labels = len(encoder.classes_)
+                else:
+                    self.logger.warning("⚠️  QueryType encoder not found, using default")
+                    num_labels = 100
+                
+                self.querytype_model = QueryTypeNNModel(self.baseline_model_name, num_labels)
+                self.querytype_model.load(str(self.querytype_model_dir))
+                self.querytype_model.to(device)
+                self.logger.info("✅ Level 3 model loaded successfully")
+            except Exception as e:
+                self.logger.warning(f"⚠️  Level 3 model not found or failed to load: {e}")
+                self.querytype_model = None
+        else:
+            self.logger.warning(f"⚠️  Level 3 (QueryType) model not found at {self.querytype_model_dir} - will be created during training")
+        
+        self.logger.info("✓ Model reload complete")
+    
+    # ========== METRICS DATABASE ==========
     
     def init_metrics_db(self):
-        """Initialize SQLite database for metrics"""
+        """Initialize SQLite database for metrics storage"""
         import sqlite3
         
-        db_path = os.path.join(self.model_dir, "metrics.db")
-        conn = sqlite3.connect(db_path)
+        os.makedirs(self.model_dir, exist_ok=True)
+        
+        conn = sqlite3.connect(str(self.metrics_db_path))
         cursor = conn.cursor()
         
         # Create runs table
@@ -578,7 +614,6 @@ class MultiTaskBertModel:
             CREATE TABLE IF NOT EXISTS runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
-                level INTEGER,
                 train_samples INTEGER,
                 test_samples INTEGER
             )
@@ -592,99 +627,101 @@ class MultiTaskBertModel:
                 task TEXT,
                 metric TEXT,
                 value REAL,
-                FOREIGN KEY (run_id) REFERENCES runs(run_id)
+                FOREIGN KEY (run_id) REFERENCES runs (run_id)
             )
         """)
         
         conn.commit()
         conn.close()
         
-        self.logger.info(f"✓ Metrics database initialized at {db_path}")
+        self.logger.info(f"✓ Metrics database initialized at {self.metrics_db_path}")
     
-    def save_metrics_to_sqlite(self, level, masterdept_accuracy, masterdept_f1, sent_accuracy, sent_f1, train_count, test_count):
+    def save_metrics_to_sqlite(self, level, accuracy, f1, train_size, test_size):
         """Save metrics to SQLite database"""
         import sqlite3
         
-        db_path = os.path.join(self.model_dir, "metrics.db")
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(self.metrics_db_path))
         cursor = conn.cursor()
         
         # Insert run
         cursor.execute("""
-            INSERT INTO runs (timestamp, level, train_samples, test_samples)
-            VALUES (?, ?, ?, ?)
-        """, (datetime.now().isoformat(), level, train_count, test_count))
+            INSERT INTO runs (timestamp, train_samples, test_samples)
+            VALUES (?, ?, ?)
+        """, (datetime.now().isoformat(), train_size, test_size))
         
         run_id = cursor.lastrowid
         
-        # Insert Level 1 metrics
-        metrics = [
-            (run_id, 'masterdepartment', 'accuracy_overall', masterdept_accuracy),
-            (run_id, 'masterdepartment', 'f1_weighted', masterdept_f1),
-            (run_id, 'sentiment', 'accuracy_overall', sent_accuracy),
-            (run_id, 'sentiment', 'f1_weighted', sent_f1)
-        ]
-        
-        cursor.executemany("""
+        # Insert metrics
+        task_name = f"level{level}"
+        cursor.execute("""
             INSERT INTO metrics (run_id, task, metric, value)
             VALUES (?, ?, ?, ?)
-        """, metrics)
+        """, (run_id, task_name, "accuracy_overall", accuracy))
+        
+        cursor.execute("""
+            INSERT INTO metrics (run_id, task, metric, value)
+            VALUES (?, ?, ?, ?)
+        """, (run_id, task_name, "f1_score", f1))
         
         conn.commit()
         conn.close()
         
-        self.logger.info(f"💾 Metrics saved to database (run_id: {run_id})")
         return run_id
     
     def save_full_classification_report_to_sqlite(self, run_id, task, y_true, y_pred):
-        """Save detailed classification report to database"""
+        """Save per-class metrics to database"""
         import sqlite3
         from sklearn.metrics import classification_report
         
-        report_dict = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+        report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
         
-        db_path = os.path.join(self.model_dir, "metrics.db")
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(self.metrics_db_path))
         cursor = conn.cursor()
         
-        metrics_to_save = []
-        
-        for label, metrics in report_dict.items():
+        for class_name, metrics in report.items():
+            if class_name in ['accuracy', 'macro avg', 'weighted avg']:
+                continue
+            
             if isinstance(metrics, dict):
                 for metric_name, value in metrics.items():
                     if metric_name in ['precision', 'recall', 'f1-score']:
-                        metric_key = f"{label}_{metric_name.replace('-', '_')}"
-                        metrics_to_save.append((run_id, task, metric_key, value))
+                        metric_key = f"{class_name}_{metric_name.replace('-', '_')}"
+                        cursor.execute("""
+                            INSERT INTO metrics (run_id, task, metric, value)
+                            VALUES (?, ?, ?, ?)
+                        """, (run_id, task, metric_key, value))
         
-        cursor.executemany("""
-            INSERT INTO metrics (run_id, task, metric, value)
-            VALUES (?, ?, ?, ?)
-        """, metrics_to_save)
+        # Add weighted averages
+        if 'weighted avg' in report:
+            for metric_name, value in report['weighted avg'].items():
+                if metric_name in ['precision', 'recall', 'f1-score']:
+                    cursor.execute("""
+                        INSERT INTO metrics (run_id, task, metric, value)
+                        VALUES (?, ?, ?, ?)
+                    """, (run_id, task, f"weighted_avg_{metric_name.replace('-', '_')}", value))
         
         conn.commit()
         conn.close()
-        
-        self.logger.info(f"💾 Detailed {task} report saved to database")
     
     def get_latest_metrics_from_db(self):
         """Retrieve latest metrics from database"""
         import sqlite3
         
-        db_path = os.path.join(self.model_dir, "metrics.db")
-        
-        if not os.path.exists(db_path):
+        if not self.metrics_db_path.exists():
             return {"error": "No metrics database found"}
         
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(self.metrics_db_path))
         cursor = conn.cursor()
         
         # Get latest run
         cursor.execute("SELECT MAX(run_id) FROM runs")
-        latest_run = cursor.fetchone()[0]
+        result = cursor.fetchone()
         
-        if latest_run is None:
+        if result[0] is None:
             conn.close()
             return {"error": "No training runs found"}
+        
+        latest_run = result[0]
         
         # Get metrics
         cursor.execute("""
@@ -704,15 +741,94 @@ class MultiTaskBertModel:
             ]
         }
     
+    # ========== DATA EXTRACTION HELPER ==========
+    
+    def _extract_taxonomy_from_task(self, task):
+        """
+        CRITICAL FIX: Extract 3-level taxonomy from Label Studio task
+        
+        Handles multiple label configurations:
+        1. Single taxonomy field with full path: ["Internet Banking", "Account Access", "Unblock"]
+        2. Multiple taxonomy fields (one per level)
+        3. Mixed configurations
+        
+        Returns: dict with masterdepartment, department, querytype
+        """
+        result = {
+            'masterdepartment': None,
+            'department': None,
+            'querytype': None,
+            'text': None
+        }
+        
+        # Extract text
+        if 'data' in task and 'html' in task['data']:
+            result['text'] = self.preload_task_data(task, task['data']['html'])
+        elif 'data' in task and 'text' in task['data']:
+            result['text'] = task['data']['text']
+        
+        # Extract annotations
+        annotations = task.get('annotations', [])
+        if not annotations:
+            return None
+        
+        annotation = annotations[0]
+        annotation_result = annotation.get('result', [])
+        
+        # Debug: Log the annotation structure
+        if len(annotation_result) > 0:
+            self.logger.debug(f"📝 Annotation structure: {annotation_result[0]}")
+        
+        # Try to extract from any taxonomy field
+        for item in annotation_result:
+            value = item.get('value', {})
+            taxonomy = value.get('taxonomy', [[]])
+            from_name = item.get('from_name', '').lower()
+            
+            if not taxonomy or not taxonomy[0]:
+                continue
+            
+            # Get the full path (could be 1, 2, or 3 levels)
+            full_path = taxonomy[0]
+            
+            self.logger.debug(f"📋 Processing taxonomy from '{from_name}': {full_path}")
+            
+            # Strategy 1: If this is a querytype field with 3 levels
+            if len(full_path) >= 3:
+                result['masterdepartment'] = full_path[0]
+                result['department'] = f"{full_path[0]} > {full_path[1]}"
+                result['querytype'] = f"{full_path[0]} > {full_path[1]} > {full_path[2]}"
+                self.logger.debug(f"✓ Extracted all 3 levels from field '{from_name}'")
+                break  # Found complete data, no need to check other fields
+            
+            # Strategy 2: If this is a department field with 2 levels
+            elif len(full_path) >= 2 and not result['department']:
+                result['masterdepartment'] = full_path[0]
+                result['department'] = f"{full_path[0]} > {full_path[1]}"
+                self.logger.debug(f"✓ Extracted 2 levels from field '{from_name}'")
+            
+            # Strategy 3: If this is a masterdepartment field with 1 level
+            elif len(full_path) >= 1 and not result['masterdepartment']:
+                result['masterdepartment'] = full_path[0]
+                self.logger.debug(f"✓ Extracted 1 level from field '{from_name}'")
+        
+        # Validation - need at least masterdepartment
+        if not result['masterdepartment']:
+            self.logger.warning(f"⚠️  No masterdepartment found in task {task.get('id', 'unknown')}")
+            self.logger.warning(f"   Annotation structure: {annotation_result}")
+            return None
+        
+        return result
+    
     # ========== TRAINING PIPELINE ==========
     
     def fit(self, event, data, tasks, **kwargs):
         """
         3-Level Hierarchical Training Pipeline
         
-        Level 1: Email → MasterDepartment + Sentiment
+        Level 1: Email → MasterDepartment
         Level 2: Email + MasterDepartment → Department
-        Level 3: Email + Department → QueryType
+        Level 3: Email + MasterDepartment + Department → QueryType
         """
         
         self.logger.info("=" * 80)
@@ -727,72 +843,75 @@ class MultiTaskBertModel:
         
         train_data = []
         for task in tasks:
-            text = self.preload_task_data(task, task['data']['html'])
-            
-            annotations = task.get('annotations', [])
-            if not annotations:
-                continue
-            
-            annotation = annotations[0]
-            result = annotation.get('result', [])
-            
-            # Extract all three levels
-            masterdepartment = None
-            department = None
-            querytype = None
-            sentiment = None
-            
-            for item in result:
-                value = item.get('value', {})
-                taxonomy = value.get('taxonomy', [[]])
-                
-                if not taxonomy or not taxonomy[0]:
-                    continue
-                
-                from_name = item.get('from_name', '')
-                
-                # Detect which field this is
-                if 'masterdepartment' in from_name.lower():
-                    # MasterDepartment > Department > QueryType
-                    full_path = taxonomy[0]
-                    if len(full_path) >= 1:
-                        masterdepartment = full_path[0]
-                    if len(full_path) >= 2:
-                        department = f"{full_path[0]} > {full_path[1]}"
-                    if len(full_path) >= 3:
-                        querytype = f"{full_path[0]} > {full_path[1]} > {full_path[2]}"
-                        
-                elif 'sentiment' in from_name.lower():
-                    sentiment = taxonomy[0][0] if taxonomy[0] else None
-            
-            if masterdepartment and sentiment:
-                train_data.append({
-                    'text': text,
-                    'masterdepartment': masterdepartment,
-                    'department': department,
-                    'querytype': querytype,
-                    'sentiment': sentiment
-                })
+            extracted = self._extract_taxonomy_from_task(task)
+            if extracted and extracted['text']:
+                train_data.append(extracted)
         
         if len(train_data) == 0:
             self.logger.error("❌ No valid training data found")
+            self.logger.error("Please check your Label Studio annotations:")
+            self.logger.error("  - Ensure tasks have taxonomy labels")
+            self.logger.error("  - Check that the taxonomy field contains hierarchical paths")
+            self.logger.error("  - Example format: ['Internet Banking', 'Account Access', 'Unblock']")
             return
         
         self.logger.info(f"✓ Prepared {len(train_data)} training samples")
         
+        # Log sample distribution
+        masterdept_count = sum(1 for d in train_data if d['masterdepartment'])
+        dept_count = sum(1 for d in train_data if d['department'])
+        qt_count = sum(1 for d in train_data if d['querytype'])
+        
+        self.logger.info(f"📊 Sample distribution:")
+        self.logger.info(f"   Level 1 (MasterDepartment): {masterdept_count} samples")
+        self.logger.info(f"   Level 2 (Department): {dept_count} samples")
+        self.logger.info(f"   Level 3 (QueryType): {qt_count} samples")
+        
+        # Log sample for debugging
+        if train_data:
+            sample = train_data[0]
+            self.logger.info(f"📝 Sample annotation:")
+            self.logger.info(f"   MasterDepartment: {sample['masterdepartment']}")
+            self.logger.info(f"   Department: {sample['department']}")
+            self.logger.info(f"   QueryType: {sample['querytype']}")
+        
         # Convert to DataFrame
         df = pd.DataFrame(train_data)
         
-        # Split train/test
+        # CRITICAL FIX: Smart train/test split with fallback
         from sklearn.model_selection import train_test_split
-        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['masterdepartment'])
+        
+        # Count samples per class
+        class_counts = df['masterdepartment'].value_counts()
+        min_samples = class_counts.min()
+        
+        if min_samples >= 2:
+            # Can use stratified split
+            self.logger.info(f"✓ Using stratified split (min class size: {min_samples})")
+            try:
+                train_df, test_df = train_test_split(
+                    df, test_size=0.2, random_state=42, 
+                    stratify=df['masterdepartment']
+                )
+            except ValueError as e:
+                self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                self.logger.warning("⚠️  Falling back to random split")
+                train_df, test_df = train_test_split(
+                    df, test_size=0.2, random_state=42
+                )
+        else:
+            # Use random split
+            self.logger.warning(f"⚠️  Some classes have only 1 sample - using random split")
+            train_df, test_df = train_test_split(
+                df, test_size=0.2, random_state=42
+            )
         
         self.logger.info(f"📊 Train: {len(train_df)} | Test: {len(test_df)}")
         
-        # ========== TRAIN LEVEL 1: MasterDepartment + Sentiment ==========
+        # ========== TRAIN LEVEL 1: MasterDepartment ONLY ==========
         self.logger.info("")
         self.logger.info("=" * 80)
-        self.logger.info("🎯 LEVEL 1 TRAINING: MasterDepartment + Sentiment")
+        self.logger.info("🎯 LEVEL 1 TRAINING: MasterDepartment ONLY")
         self.logger.info("=" * 80)
         
         self._train_level1(train_df, test_df)
@@ -808,9 +927,12 @@ class MultiTaskBertModel:
         dept_test_df = test_df[test_df['department'].notna()].copy()
         
         if len(dept_train_df) > 0:
+            self.logger.info(f"📊 Department training samples: {len(dept_train_df)}")
             self._train_level2(dept_train_df, dept_test_df)
         else:
             self.logger.warning("⚠️  No Department labels found - skipping Level 2 training")
+            self.logger.warning("⚠️  Make sure your Label Studio tasks have at least 2-level taxonomy:")
+            self.logger.warning("    Example: ['Internet Banking', 'Account Access']")
         
         # ========== TRAIN LEVEL 3: QueryType ==========
         self.logger.info("")
@@ -823,9 +945,12 @@ class MultiTaskBertModel:
         qt_test_df = test_df[test_df['querytype'].notna()].copy()
         
         if len(qt_train_df) > 0:
+            self.logger.info(f"📊 QueryType training samples: {len(qt_train_df)}")
             self._train_level3(qt_train_df, qt_test_df)
         else:
             self.logger.warning("⚠️  No QueryType labels found - skipping Level 3 training")
+            self.logger.warning("⚠️  Make sure your Label Studio tasks have 3-level taxonomy:")
+            self.logger.warning("    Example: ['Internet Banking', 'Account Access', 'Unblock']")
         
         self.logger.info("")
         self.logger.info("=" * 80)
@@ -833,33 +958,25 @@ class MultiTaskBertModel:
         self.logger.info("=" * 80)
     
     def _train_level1(self, train_df, test_df):
-        """Train Level 1: MasterDepartment + Sentiment"""
+        """Train Level 1: MasterDepartment ONLY"""
         
         from sklearn.preprocessing import LabelEncoder
         
         # Encode labels
         masterdept_encoder = LabelEncoder()
-        sentiment_encoder = LabelEncoder()
         
         train_masterdept_encoded = masterdept_encoder.fit_transform(train_df['masterdepartment'])
-        train_sentiment_encoded = sentiment_encoder.fit_transform(train_df['sentiment'])
-        
         test_masterdept_encoded = masterdept_encoder.transform(test_df['masterdepartment'])
-        test_sentiment_encoded = sentiment_encoder.transform(test_df['sentiment'])
         
         self.logger.info(f"📊 MasterDepartment classes: {len(masterdept_encoder.classes_)}")
-        self.logger.info(f"📊 Sentiment classes: {len(sentiment_encoder.classes_)}")
         
         # Initialize model
         num_masterdept = len(masterdept_encoder.classes_)
-        num_sentiment = len(sentiment_encoder.classes_)
-        
         device = self._get_device()
         
-        model = MultiTaskNNModel(
+        model = MasterDepartmentModel(
             self.baseline_model_name,
-            classificationlabel_length=num_masterdept,
-            sentimentlabel_length=num_sentiment
+            num_labels=num_masterdept
         )
         model.to(device)
         
@@ -873,24 +990,21 @@ class MultiTaskBertModel:
         # Create DataLoaders
         train_dataloader = self._create_dataloader(
             train_inputs, train_masks,
-            labels=list(zip(train_masterdept_encoded, train_sentiment_encoded)),
+            labels=train_masterdept_encoded,
             batch_size=16,
             shuffle=True
         )
         
         # Training setup
-        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 10))
+        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 3))
         LEARNING_RATE = float(os.getenv('LEARNING_RATE', 2e-5))
         
         optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, eps=1e-8)
-        
-        # Loss functions
-        criterion_masterdept = nn.CrossEntropyLoss()
-        criterion_sentiment = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss()
         
         # Training logger
         training_logger = TrainingLogger(self.logger, NUM_EPOCHS, len(train_dataloader))
-        training_logger.start_training("Level 1 (MasterDepartment + Sentiment)")
+        training_logger.start_training("Level 1 (MasterDepartment)")
         
         # Training loop
         for epoch in range(NUM_EPOCHS):
@@ -902,32 +1016,21 @@ class MultiTaskBertModel:
             for batch_idx, batch in enumerate(train_dataloader):
                 input_ids, attention_mask, labels_batch = [t.to(device) for t in batch]
                 
-                # Unpack labels
-                masterdept_labels = labels_batch[:, 0].long()
-                sentiment_labels = labels_batch[:, 1].long()
-                
                 optimizer.zero_grad()
                 
                 # Forward pass
-                masterdept_logits, sentiment_logits, _, _ = model(input_ids, attention_mask)
+                logits = model(input_ids, attention_mask)
                 
-                # Calculate losses
-                loss_masterdept = criterion_masterdept(masterdept_logits, masterdept_labels)
-                loss_sentiment = criterion_sentiment(sentiment_logits, sentiment_labels)
-                
-                total_loss_batch = loss_masterdept + loss_sentiment
+                # Calculate loss
+                loss = criterion(logits, labels_batch)
                 
                 # Backward pass
-                total_loss_batch.backward()
+                loss.backward()
                 optimizer.step()
                 
-                total_loss += total_loss_batch.item()
+                total_loss += loss.item()
                 
-                training_logger.log_batch(
-                    epoch, batch_idx, total_loss_batch.item(),
-                    MasterDept=loss_masterdept.item(),
-                    Sentiment=loss_sentiment.item()
-                )
+                training_logger.log_batch(epoch, batch_idx, loss.item())
             
             avg_loss = total_loss / len(train_dataloader)
             training_logger.end_epoch(epoch, avg_loss)
@@ -947,59 +1050,45 @@ class MultiTaskBertModel:
         )
         
         masterdept_preds = []
-        sentiment_preds = []
         
         with torch.no_grad():
             for batch in test_dataloader:
                 input_ids, attention_mask = [t.to(device) for t in batch]
-                
-                masterdept_logits, sentiment_logits, _, _ = model(input_ids, attention_mask)
-                
-                masterdept_preds.extend(torch.argmax(masterdept_logits, dim=1).cpu().numpy())
-                sentiment_preds.extend(torch.argmax(sentiment_logits, dim=1).cpu().numpy())
+                logits = model(input_ids, attention_mask)
+                preds = torch.argmax(logits, dim=1)
+                masterdept_preds.extend(preds.cpu().numpy())
         
         # Calculate metrics
-        masterdept_accuracy = accuracy_score(test_masterdept_encoded, masterdept_preds)
-        masterdept_f1 = f1_score(test_masterdept_encoded, masterdept_preds, average='weighted', zero_division=0)
+        md_accuracy = accuracy_score(test_masterdept_encoded, masterdept_preds)
+        md_f1 = f1_score(test_masterdept_encoded, masterdept_preds, average='weighted', zero_division=0)
         
-        sentiment_accuracy = accuracy_score(test_sentiment_encoded, sentiment_preds)
-        sentiment_f1 = f1_score(test_sentiment_encoded, sentiment_preds, average='weighted', zero_division=0)
+        self.logger.info(f"✅ Level 1 Accuracy: {md_accuracy:.4f}")
+        self.logger.info(f"✅ Level 1 F1-Score: {md_f1:.4f}")
         
-        self.logger.info(f"✅ MasterDepartment - Accuracy: {masterdept_accuracy:.4f} | F1: {masterdept_f1:.4f}")
-        self.logger.info(f"✅ Sentiment - Accuracy: {sentiment_accuracy:.4f} | F1: {sentiment_f1:.4f}")
+        # Save model and encoder
+        model.set_encoder(masterdept_encoder)
+        model.save(str(self.masterdepartment_model_dir))
         
-        # Save model
-        model.set_encoders(masterdept_encoder, sentiment_encoder)
+        # Update instance model
+        self.model = model
         
-        save_path = os.path.join(self.model_dir, self.finetuned_model_name)
-        model.SaveModel(save_path)
-        
-        # Save tokenizer
-        tokenizer.save_pretrained(save_path)
-        
-        self.logger.info(f"💾 Level 1 model saved to {save_path}")
-        
-        # Save metrics
-        decoded_masterdept_true = masterdept_encoder.inverse_transform(test_masterdept_encoded)
-        decoded_masterdept_pred = masterdept_encoder.inverse_transform(masterdept_preds)
-        decoded_sent_true = sentiment_encoder.inverse_transform(test_sentiment_encoded)
-        decoded_sent_pred = sentiment_encoder.inverse_transform(sentiment_preds)
+        # Save metrics to database
+        decoded_md_true = masterdept_encoder.inverse_transform(test_masterdept_encoded)
+        decoded_md_pred = masterdept_encoder.inverse_transform(masterdept_preds)
         
         run_id = self.save_metrics_to_sqlite(
-            1, masterdept_accuracy, masterdept_f1,
-            sentiment_accuracy, sentiment_f1,
+            1, md_accuracy, md_f1,
             len(train_df), len(test_df)
         )
         
-        self.save_full_classification_report_to_sqlite(run_id, "masterdepartment", decoded_masterdept_true, decoded_masterdept_pred)
-        self.save_full_classification_report_to_sqlite(run_id, "sentiment", decoded_sent_true, decoded_sent_pred)
+        self.save_full_classification_report_to_sqlite(run_id, "masterdepartment", decoded_md_true, decoded_md_pred)
     
     def _train_level2(self, train_df, test_df):
         """Train Level 2: Department (conditioned on MasterDepartment)"""
         
         from sklearn.preprocessing import LabelEncoder
         
-        # Encode labels
+        # Encode department labels
         dept_encoder = LabelEncoder()
         
         train_dept_encoded = dept_encoder.fit_transform(train_df['department'])
@@ -1008,32 +1097,32 @@ class MultiTaskBertModel:
         self.logger.info(f"📊 Department classes: {len(dept_encoder.classes_)}")
         
         # Initialize model
-        num_departments = len(dept_encoder.classes_)
+        num_dept = len(dept_encoder.classes_)
         device = self._get_device()
         
-        model = DepartmentNNModel(
+        dept_model = DepartmentNNModel(
             self.baseline_model_name,
-            num_labels=num_departments
+            num_labels=num_dept
         )
-        model.to(device)
+        dept_model.to(device)
         
-        # Prepare conditional input: "MasterDepartment: X Email: Y"
-        train_texts_conditional = [
-            f"MasterDepartment: {row['masterdepartment']} Email: {row['text']}"
-            for _, row in train_df.iterrows()
+        # Create conditional texts (prepend MasterDepartment)
+        train_conditional_texts = [
+            f"MasterDepartment: {md} Email: {text}"
+            for md, text in zip(train_df['masterdepartment'], train_df['text'])
         ]
         
-        test_texts_conditional = [
-            f"MasterDepartment: {row['masterdepartment']} Email: {row['text']}"
-            for _, row in test_df.iterrows()
+        test_conditional_texts = [
+            f"MasterDepartment: {md} Email: {text}"
+            for md, text in zip(test_df['masterdepartment'], test_df['text'])
         ]
         
         # Tokenize
         tokenizer = self.tokenizer
         MAX_LEN = 256
         
-        train_inputs, train_masks = self._tokenize_and_pad(train_texts_conditional, tokenizer, MAX_LEN)
-        test_inputs, test_masks = self._tokenize_and_pad(test_texts_conditional, tokenizer, MAX_LEN)
+        train_inputs, train_masks = self._tokenize_and_pad(train_conditional_texts, tokenizer, MAX_LEN)
+        test_inputs, test_masks = self._tokenize_and_pad(test_conditional_texts, tokenizer, MAX_LEN)
         
         # Create DataLoaders
         train_dataloader = self._create_dataloader(
@@ -1044,10 +1133,10 @@ class MultiTaskBertModel:
         )
         
         # Training setup
-        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 10))
+        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 3))
         LEARNING_RATE = float(os.getenv('LEARNING_RATE', 2e-5))
         
-        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, eps=1e-8)
+        optimizer = AdamW(dept_model.parameters(), lr=LEARNING_RATE, eps=1e-8)
         criterion = nn.CrossEntropyLoss()
         
         # Training logger
@@ -1058,7 +1147,7 @@ class MultiTaskBertModel:
         for epoch in range(NUM_EPOCHS):
             training_logger.start_epoch(epoch)
             
-            model.train()
+            dept_model.train()
             total_loss = 0
             
             for batch_idx, batch in enumerate(train_dataloader):
@@ -1067,7 +1156,7 @@ class MultiTaskBertModel:
                 optimizer.zero_grad()
                 
                 # Forward pass
-                logits = model(input_ids, attention_mask)
+                logits = dept_model(input_ids, attention_mask)
                 
                 # Calculate loss
                 loss = criterion(logits, labels_batch)
@@ -1089,7 +1178,7 @@ class MultiTaskBertModel:
         self.logger.info("")
         self.logger.info("📊 Evaluating Level 2 model...")
         
-        model.eval()
+        dept_model.eval()
         
         test_dataloader = self._create_dataloader(
             test_inputs, test_masks,
@@ -1102,41 +1191,41 @@ class MultiTaskBertModel:
         with torch.no_grad():
             for batch in test_dataloader:
                 input_ids, attention_mask = [t.to(device) for t in batch]
-                
-                logits = model(input_ids, attention_mask)
-                dept_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                logits = dept_model(input_ids, attention_mask)
+                preds = torch.argmax(logits, dim=1)
+                dept_preds.extend(preds.cpu().numpy())
         
         # Calculate metrics
         dept_accuracy = accuracy_score(test_dept_encoded, dept_preds)
         dept_f1 = f1_score(test_dept_encoded, dept_preds, average='weighted', zero_division=0)
         
-        self.logger.info(f"✅ Department - Accuracy: {dept_accuracy:.4f} | F1: {dept_f1:.4f}")
+        self.logger.info(f"✅ Level 2 Accuracy: {dept_accuracy:.4f}")
+        self.logger.info(f"✅ Level 2 F1-Score: {dept_f1:.4f}")
         
-        # Save model
-        model.set_encoder(dept_encoder)
+        # Save model and encoder
+        dept_model.set_encoder(dept_encoder)
+        dept_model.save(str(self.department_model_dir))
         
-        save_path = os.path.join(self.model_dir, "department_model")
-        model.save(save_path)
+        # Update instance model
+        self.department_model = dept_model
         
-        self.logger.info(f"💾 Level 2 model saved to {save_path}")
-        
-        # Save metrics
+        # Save metrics to database
         decoded_dept_true = dept_encoder.inverse_transform(test_dept_encoded)
         decoded_dept_pred = dept_encoder.inverse_transform(dept_preds)
         
         run_id = self.save_metrics_to_sqlite(
-            2, dept_accuracy, dept_f1, 0, 0,
+            2, dept_accuracy, dept_f1,
             len(train_df), len(test_df)
         )
         
         self.save_full_classification_report_to_sqlite(run_id, "department", decoded_dept_true, decoded_dept_pred)
     
     def _train_level3(self, train_df, test_df):
-        """Train Level 3: QueryType (conditioned on Department)"""
+        """Train Level 3: QueryType (conditioned on MasterDepartment + Department)"""
         
         from sklearn.preprocessing import LabelEncoder
         
-        # Encode labels
+        # Encode querytype labels
         qt_encoder = LabelEncoder()
         
         train_qt_encoded = qt_encoder.fit_transform(train_df['querytype'])
@@ -1145,32 +1234,32 @@ class MultiTaskBertModel:
         self.logger.info(f"📊 QueryType classes: {len(qt_encoder.classes_)}")
         
         # Initialize model
-        num_querytypes = len(qt_encoder.classes_)
+        num_qt = len(qt_encoder.classes_)
         device = self._get_device()
         
-        model = SubQueryNNModel(
+        qt_model = QueryTypeNNModel(
             self.baseline_model_name,
-            num_labels=num_querytypes
+            num_labels=num_qt
         )
-        model.to(device)
+        qt_model.to(device)
         
-        # Prepare conditional input: "Department: X Email: Y"
-        train_texts_conditional = [
-            f"Department: {row['department']} Email: {row['text']}"
-            for _, row in train_df.iterrows()
+        # Create conditional texts (prepend MasterDepartment + Department)
+        train_conditional_texts = [
+            f"MasterDepartment: {md} Department: {dept} Email: {text}"
+            for md, dept, text in zip(train_df['masterdepartment'], train_df['department'], train_df['text'])
         ]
         
-        test_texts_conditional = [
-            f"Department: {row['department']} Email: {row['text']}"
-            for _, row in test_df.iterrows()
+        test_conditional_texts = [
+            f"MasterDepartment: {md} Department: {dept} Email: {text}"
+            for md, dept, text in zip(test_df['masterdepartment'], test_df['department'], test_df['text'])
         ]
         
         # Tokenize
         tokenizer = self.tokenizer
         MAX_LEN = 256
         
-        train_inputs, train_masks = self._tokenize_and_pad(train_texts_conditional, tokenizer, MAX_LEN)
-        test_inputs, test_masks = self._tokenize_and_pad(test_texts_conditional, tokenizer, MAX_LEN)
+        train_inputs, train_masks = self._tokenize_and_pad(train_conditional_texts, tokenizer, MAX_LEN)
+        test_inputs, test_masks = self._tokenize_and_pad(test_conditional_texts, tokenizer, MAX_LEN)
         
         # Create DataLoaders
         train_dataloader = self._create_dataloader(
@@ -1181,10 +1270,10 @@ class MultiTaskBertModel:
         )
         
         # Training setup
-        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 10))
+        NUM_EPOCHS = int(os.getenv('NUM_TRAIN_EPOCHS', 3))
         LEARNING_RATE = float(os.getenv('LEARNING_RATE', 2e-5))
         
-        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, eps=1e-8)
+        optimizer = AdamW(qt_model.parameters(), lr=LEARNING_RATE, eps=1e-8)
         criterion = nn.CrossEntropyLoss()
         
         # Training logger
@@ -1195,7 +1284,7 @@ class MultiTaskBertModel:
         for epoch in range(NUM_EPOCHS):
             training_logger.start_epoch(epoch)
             
-            model.train()
+            qt_model.train()
             total_loss = 0
             
             for batch_idx, batch in enumerate(train_dataloader):
@@ -1204,7 +1293,7 @@ class MultiTaskBertModel:
                 optimizer.zero_grad()
                 
                 # Forward pass
-                logits = model(input_ids, attention_mask)
+                logits = qt_model(input_ids, attention_mask)
                 
                 # Calculate loss
                 loss = criterion(logits, labels_batch)
@@ -1226,7 +1315,7 @@ class MultiTaskBertModel:
         self.logger.info("")
         self.logger.info("📊 Evaluating Level 3 model...")
         
-        model.eval()
+        qt_model.eval()
         
         test_dataloader = self._create_dataloader(
             test_inputs, test_masks,
@@ -1239,30 +1328,30 @@ class MultiTaskBertModel:
         with torch.no_grad():
             for batch in test_dataloader:
                 input_ids, attention_mask = [t.to(device) for t in batch]
-                
-                logits = model(input_ids, attention_mask)
-                qt_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                logits = qt_model(input_ids, attention_mask)
+                preds = torch.argmax(logits, dim=1)
+                qt_preds.extend(preds.cpu().numpy())
         
         # Calculate metrics
         qt_accuracy = accuracy_score(test_qt_encoded, qt_preds)
         qt_f1 = f1_score(test_qt_encoded, qt_preds, average='weighted', zero_division=0)
         
-        self.logger.info(f"✅ QueryType - Accuracy: {qt_accuracy:.4f} | F1: {qt_f1:.4f}")
+        self.logger.info(f"✅ Level 3 Accuracy: {qt_accuracy:.4f}")
+        self.logger.info(f"✅ Level 3 F1-Score: {qt_f1:.4f}")
         
-        # Save model
-        model.set_encoder(qt_encoder)
+        # Save model and encoder
+        qt_model.set_encoder(qt_encoder)
+        qt_model.save(str(self.querytype_model_dir))
         
-        save_path = os.path.join(self.model_dir, "querytype_model")
-        model.save(save_path)
+        # Update instance model
+        self.querytype_model = qt_model
         
-        self.logger.info(f"💾 Level 3 model saved to {save_path}")
-        
-        # Save metrics
+        # Save metrics to database
         decoded_qt_true = qt_encoder.inverse_transform(test_qt_encoded)
         decoded_qt_pred = qt_encoder.inverse_transform(qt_preds)
         
         run_id = self.save_metrics_to_sqlite(
-            3, qt_accuracy, qt_f1, 0, 0,
+            3, qt_accuracy, qt_f1,
             len(train_df), len(test_df)
         )
         
@@ -1278,9 +1367,9 @@ class MultiTaskBertModel:
         3-LEVEL HIERARCHICAL INFERENCE PIPELINE
         
         Just pass email text, automatically routes through:
-        1. Level 1: Email → MasterDepartment + Sentiment
-        2. Level 2: Email + predicted MasterDepartment → Department
-        3. Level 3: Email + predicted Department → QueryType
+        1. Level 1: Email → MasterDepartment
+        2. Level 2: Email + MasterDepartment → Department
+        3. Level 3: Email + MasterDepartment + Department → QueryType
         
         Returns all predictions in a single result.
         """
@@ -1296,9 +1385,6 @@ class MultiTaskBertModel:
         def getQueryTypeAttrName(attrs):
             return attrs == "querytype"
 
-        def getSentimentAttrName(attrs):
-            return attrs == 'sentiment'
-
         from_name_masterdepartment, to_name_masterdepartment, _ = \
             self.label_interface.get_first_tag_occurence(
                 'Taxonomy', 'HyperText', getMasterDepartmentAttrName
@@ -1312,11 +1398,6 @@ class MultiTaskBertModel:
         from_name_querytype, to_name_querytype, _ = \
             self.label_interface.get_first_tag_occurence(
                 "Taxonomy", "HyperText", getQueryTypeAttrName
-            )
-
-        from_name_sentiment, to_name_sentiment, _ = \
-            self.label_interface.get_first_tag_occurence(
-                'Taxonomy', 'HyperText', getSentimentAttrName
             )
 
         tokenizer = self.tokenizer
@@ -1338,7 +1419,11 @@ class MultiTaskBertModel:
             _inputs, _masks, batch_size=batch_size, shuffle=False
         )
 
-        device = self._get_device()  # Using helper function
+        device = self._get_device()
+
+        if self.model is None:
+            self.logger.error("❌ Level 1 model not loaded - cannot make predictions")
+            return []
 
         self.model.to(device)
         self.model.eval()
@@ -1358,30 +1443,19 @@ class MultiTaskBertModel:
             self.logger.info("⚠️  Level 3 model not loaded - QueryType predictions skipped")
 
         predictions = []
-
-        # Global index to align batch ↔ texts
         global_text_idx = 0
 
         with torch.no_grad():
             for batch in dataloader:
                 input_ids, attention_mask = [t.to(device) for t in batch]
     
-                # ========== LEVEL 1: MasterDepartment + Sentiment ==========
-                masterdept_logits, sentiment_logits, _, _ = \
-                    self.model(input_ids, attention_mask)
-
+                # ========== LEVEL 1: MasterDepartment ==========
+                masterdept_logits = self.model(input_ids, attention_mask)
                 masterdept_probs = torch.softmax(masterdept_logits, dim=1)
-                sentiment_probs = torch.softmax(sentiment_logits, dim=1)
-
                 masterdept_preds = torch.argmax(masterdept_probs, dim=1)
-                sentiment_preds = torch.argmax(sentiment_probs, dim=1)
 
-                # Using helper function for decoding
                 decoded_masterdept_preds = self._decode_predictions(
                     masterdept_preds, 'masterdepartment'
-                )
-                decoded_sentiment_preds = self._decode_predictions(
-                    sentiment_preds, 'sentiment'
                 )
 
                 for i in range(len(masterdept_preds)):
@@ -1401,20 +1475,8 @@ class MultiTaskBertModel:
                         }
                     })
 
-                    # ---------- SENTIMENT ----------
-                    predictions.append({
-                        "from_name": from_name_sentiment,
-                        "to_name": to_name_sentiment,
-                        "type": "taxonomy",
-                        "value": {
-                            "taxonomy": [[decoded_sentiment_preds[i]]],
-                            "score": sentiment_probs[i][sentiment_preds[i]].item()
-                        }
-                    })
-
                     # ========== LEVEL 2: DEPARTMENT ==========
                     if self.department_model is not None:
-                        # Use PREDICTED MasterDepartment from Level 1
                         conditional_text = (
                             f"MasterDepartment: {decoded_masterdept_preds[i]} "
                             f"Email: {text}"
@@ -1426,7 +1488,6 @@ class MultiTaskBertModel:
                             max_length=256,
                             truncation=True
                         )
-
                         dept_mask = [int(t > 0) for t in dept_ids]
 
                         dept_logits = self.department_model(
@@ -1434,14 +1495,12 @@ class MultiTaskBertModel:
                             torch.tensor([dept_mask]).to(device)
                         )
 
-                        # Unwrap if model returns tuple
                         if isinstance(dept_logits, (tuple, list)):
                             dept_logits = dept_logits[0]
 
                         dept_probs = torch.softmax(dept_logits, dim=1)
                         dept_idx = torch.argmax(dept_probs, dim=1).item()
 
-                        # Using helper function for decoding
                         department_label = self._decode_predictions(
                             [dept_idx], "department"
                         )[0]
@@ -1458,8 +1517,8 @@ class MultiTaskBertModel:
 
                         # ========== LEVEL 3: QUERY TYPE ==========
                         if self.querytype_model is not None:
-                            # Use PREDICTED Department from Level 2
                             conditional_text_qt = (
+                                f"MasterDepartment: {decoded_masterdept_preds[i]} "
                                 f"Department: {department_label} "
                                 f"Email: {text}"
                             )
@@ -1470,7 +1529,6 @@ class MultiTaskBertModel:
                                 max_length=256,
                                 truncation=True
                             )
-
                             qt_mask = [int(t > 0) for t in qt_ids]
 
                             qt_logits = self.querytype_model(
@@ -1478,14 +1536,12 @@ class MultiTaskBertModel:
                                 torch.tensor([qt_mask]).to(device)
                             )
 
-                            # Unwrap if model returns tuple
                             if isinstance(qt_logits, (tuple, list)):
                                 qt_logits = qt_logits[0]
 
                             qt_probs = torch.softmax(qt_logits, dim=1)
                             qt_idx = torch.argmax(qt_probs, dim=1).item()
 
-                            # Using helper function for decoding
                             querytype_label = self._decode_predictions(
                                 [qt_idx], "querytype"
                             )[0]
