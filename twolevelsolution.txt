@@ -1,0 +1,173 @@
+def fit(self, event, data, tasks, **kwargs):
+        """
+        3-Level Hierarchical Training Pipeline
+        
+        Level 1: Email → MasterDepartment
+        Level 2: Email + MasterDepartment → Department
+        Level 3: Email + MasterDepartment + Department → QueryType
+        """
+        
+        self.logger.info("=" * 80)
+        self.logger.info("🚀 3-LEVEL HIERARCHICAL TRAINING INITIATED")
+        self.logger.info("=" * 80)
+        
+        # Initialize database
+        self.init_metrics_db()
+        
+        # ========== PREPARE DATA ==========
+        self.logger.info("📊 Preparing training data...")
+        
+        train_data = []
+        for task in tasks:
+            extracted = self._extract_taxonomy_from_task(task)
+            if extracted and extracted['text']:
+                train_data.append(extracted)
+        
+        if len(train_data) == 0:
+            self.logger.error("❌ No valid training data found")
+            self.logger.error("Please check your Label Studio annotations:")
+            self.logger.error("  - Ensure tasks have 'masterdepartment' labels")
+            self.logger.error("  - Check that taxonomy fields are properly configured")
+            return
+        
+        self.logger.info(f"✓ Prepared {len(train_data)} training samples")
+        
+        # Log sample for debugging
+        if train_data:
+            sample = train_data[0]
+            self.logger.info(f"📝 Sample annotation:")
+            self.logger.info(f"   MasterDepartment: {sample['masterdepartment']}")
+            self.logger.info(f"   Department: {sample['department']}")
+            self.logger.info(f"   QueryType: {sample['querytype']}")
+        
+        # Log distribution
+        masterdept_count = sum(1 for d in train_data if d['masterdepartment'])
+        dept_count = sum(1 for d in train_data if d['department'])
+        qt_count = sum(1 for d in train_data if d['querytype'])
+        
+        self.logger.info(f"📊 Label distribution:")
+        self.logger.info(f"   Level 1 (MasterDepartment): {masterdept_count} samples")
+        self.logger.info(f"   Level 2 (Department): {dept_count} samples")
+        self.logger.info(f"   Level 3 (QueryType): {qt_count} samples")
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(train_data)
+        
+        from sklearn.model_selection import train_test_split
+        
+        # ========== TRAIN LEVEL 1: MasterDepartment ONLY ==========
+        self.logger.info("")
+        self.logger.info("=" * 80)
+        self.logger.info("🎯 LEVEL 1 TRAINING: MasterDepartment ONLY")
+        self.logger.info("=" * 80)
+        
+        # Split for Level 1
+        class_counts = df['masterdepartment'].value_counts()
+        min_samples = class_counts.min()
+        
+        if min_samples >= 2:
+            self.logger.info(f"✓ Using stratified split (min class size: {min_samples})")
+            try:
+                level1_train_df, level1_test_df = train_test_split(
+                    df, test_size=0.2, random_state=42, 
+                    stratify=df['masterdepartment']
+                )
+            except ValueError as e:
+                self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                self.logger.warning("⚠️  Falling back to random split")
+                level1_train_df, level1_test_df = train_test_split(
+                    df, test_size=0.2, random_state=42
+                )
+        else:
+            self.logger.warning(f"⚠️  Some classes have only 1 sample - using random split")
+            level1_train_df, level1_test_df = train_test_split(
+                df, test_size=0.2, random_state=42
+            )
+        
+        self.logger.info(f"📊 Level 1 - Train: {len(level1_train_df)} | Test: {len(level1_test_df)}")
+        self._train_level1(level1_train_df, level1_test_df)
+        
+        # ========== TRAIN LEVEL 2: Department ==========
+        self.logger.info("")
+        self.logger.info("=" * 80)
+        self.logger.info("🎯 LEVEL 2 TRAINING: Department")
+        self.logger.info("=" * 80)
+        
+        # Filter samples with department labels FIRST
+        dept_df = df[df['department'].notna()].copy()
+        
+        if len(dept_df) > 0:
+            self.logger.info(f"📊 Department samples: {len(dept_df)}")
+            
+            # NOW split the filtered data
+            dept_class_counts = dept_df['department'].value_counts()
+            dept_min_samples = dept_class_counts.min()
+            
+            if dept_min_samples >= 2:
+                self.logger.info(f"✓ Using stratified split for departments (min class size: {dept_min_samples})")
+                try:
+                    dept_train_df, dept_test_df = train_test_split(
+                        dept_df, test_size=0.2, random_state=42,
+                        stratify=dept_df['department']
+                    )
+                except ValueError as e:
+                    self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                    self.logger.warning("⚠️  Falling back to random split")
+                    dept_train_df, dept_test_df = train_test_split(
+                        dept_df, test_size=0.2, random_state=42
+                    )
+            else:
+                self.logger.warning(f"⚠️  Some department classes have only 1 sample - using random split")
+                dept_train_df, dept_test_df = train_test_split(
+                    dept_df, test_size=0.2, random_state=42
+                )
+            
+            self.logger.info(f"📊 Level 2 - Train: {len(dept_train_df)} | Test: {len(dept_test_df)}")
+            self._train_level2(dept_train_df, dept_test_df)
+        else:
+            self.logger.warning("⚠️  No Department labels found - skipping Level 2 training")
+        
+        # ========== TRAIN LEVEL 3: QueryType ==========
+        self.logger.info("")
+        self.logger.info("=" * 80)
+        self.logger.info("🎯 LEVEL 3 TRAINING: QueryType")
+        self.logger.info("=" * 80)
+        
+        # Filter samples with querytype labels FIRST
+        qt_df = df[df['querytype'].notna()].copy()
+        
+        if len(qt_df) > 0:
+            self.logger.info(f"📊 QueryType samples: {len(qt_df)}")
+            
+            # NOW split the filtered data
+            qt_class_counts = qt_df['querytype'].value_counts()
+            qt_min_samples = qt_class_counts.min()
+            
+            if qt_min_samples >= 2:
+                self.logger.info(f"✓ Using stratified split for querytypes (min class size: {qt_min_samples})")
+                try:
+                    qt_train_df, qt_test_df = train_test_split(
+                        qt_df, test_size=0.2, random_state=42,
+                        stratify=qt_df['querytype']
+                    )
+                except ValueError as e:
+                    self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                    self.logger.warning("⚠️  Falling back to random split")
+                    qt_train_df, qt_test_df = train_test_split(
+                        qt_df, test_size=0.2, random_state=42
+                    )
+            else:
+                self.logger.warning(f"⚠️  Some querytype classes have only 1 sample - using random split")
+                qt_train_df, qt_test_df = train_test_split(
+                    qt_df, test_size=0.2, random_state=42
+                )
+            
+            self.logger.info(f"📊 Level 3 - Train: {len(qt_train_df)} | Test: {len(qt_test_df)}")
+            self._train_level3(qt_train_df, qt_test_df)
+        else:
+            self.logger.warning("⚠️  No QueryType labels found - skipping Level 3 training")
+        
+        self.logger.info("")
+        self.logger.info("=" * 80)
+        self.logger.info("🎉 3-LEVEL HIERARCHICAL TRAINING COMPLETE")
+        self.logger.info("=" * 80)
