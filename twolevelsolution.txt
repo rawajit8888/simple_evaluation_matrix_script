@@ -391,45 +391,60 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
                 self.logger.error(error_msg)
                 return []
             
-            if self.label_interface is None:
-                error_msg = "❌ Label interface not set - cannot make predictions"
-                self.logger.error(error_msg)
-                return []
+            # NOTE: label_interface is optional - only needed for Label Studio mode
             
             self.logger.info("✓ All required components loaded")
 
-            # ========== GET LABEL STUDIO TAGS ==========
+            # ========== GET LABEL STUDIO TAGS (Optional for external calls) ==========
             try:
-                def getMasterDepartmentAttrName(attrs):
-                    return attrs == "masterdepartment"
+                if self.label_interface is not None:
+                    # Label Studio mode - get proper tags
+                    def getMasterDepartmentAttrName(attrs):
+                        return attrs == "masterdepartment"
 
-                def getDepartmentAttrName(attrs):
-                    return attrs == "department"
+                    def getDepartmentAttrName(attrs):
+                        return attrs == "department"
 
-                def getQueryTypeAttrName(attrs):
-                    return attrs == "querytype"
+                    def getQueryTypeAttrName(attrs):
+                        return attrs == "querytype"
 
-                from_name_masterdepartment, to_name_masterdepartment, _ = \
-                    self.label_interface.get_first_tag_occurence(
-                        'Taxonomy', 'HyperText', getMasterDepartmentAttrName
-                    )
+                    from_name_masterdepartment, to_name_masterdepartment, _ = \
+                        self.label_interface.get_first_tag_occurence(
+                            'Taxonomy', 'HyperText', getMasterDepartmentAttrName
+                        )
 
-                from_name_department, to_name_department, _ = \
-                    self.label_interface.get_first_tag_occurence(
-                        "Taxonomy", "HyperText", getDepartmentAttrName
-                    )
+                    from_name_department, to_name_department, _ = \
+                        self.label_interface.get_first_tag_occurence(
+                            "Taxonomy", "HyperText", getDepartmentAttrName
+                        )
 
-                from_name_querytype, to_name_querytype, _ = \
-                    self.label_interface.get_first_tag_occurence(
-                        "Taxonomy", "HyperText", getQueryTypeAttrName
-                    )
-                
-                self.logger.info("✓ Label Studio tags retrieved successfully")
+                    from_name_querytype, to_name_querytype, _ = \
+                        self.label_interface.get_first_tag_occurence(
+                            "Taxonomy", "HyperText", getQueryTypeAttrName
+                        )
+                    
+                    self.logger.info("✓ Label Studio tags retrieved successfully")
+                else:
+                    # External API mode - use default tags
+                    from_name_masterdepartment = "masterdepartment"
+                    to_name_masterdepartment = "text"
+                    from_name_department = "department"
+                    to_name_department = "text"
+                    from_name_querytype = "querytype"
+                    to_name_querytype = "text"
+                    
+                    self.logger.info("✓ Using default tags (external API mode)")
                 
             except Exception as e:
-                self.logger.error(f"❌ Error getting Label Studio tags: {e}")
-                self.logger.exception("Full traceback:")
-                return []
+                self.logger.error(f"❌ Error getting tags: {e}")
+                # Use defaults as fallback
+                from_name_masterdepartment = "masterdepartment"
+                to_name_masterdepartment = "text"
+                from_name_department = "department"
+                to_name_department = "text"
+                from_name_querytype = "querytype"
+                to_name_querytype = "text"
+                self.logger.info("✓ Using fallback default tags")
 
             # ========== EXTRACT TEXT FROM INPUT ==========
             try:
@@ -718,57 +733,3 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
             
             # Return empty list instead of crashing
             return []
-```
-
----
-
-## **What This Does:**
-
-### ✅ **Comprehensive Error Handling:**
-- Every section wrapped in try-except
-- Errors logged with full traceback
-- Returns `[]` instead of crashing (no 500 error)
-
-### ✅ **Detailed Logging:**
-- Shows exactly what's happening at each step
-- Logs input types, shapes, predictions
-- Easy to debug any issues
-
-### ✅ **Robust Input Handling:**
-- Handles: strings, lists, dicts, mixed inputs
-- Extracts text from various formats
-- Validates all inputs before processing
-
-### ✅ **Safe Execution:**
-- Validates models and tokenizer are loaded
-- Continues processing even if Level 2/3 fail
-- Never crashes - always returns valid response
-
-### ✅ **Production Ready:**
-- Converts all scores to float (not tensors)
-- Proper device handling
-- Memory efficient with torch.no_grad()
-
----
-
-## **After This Change:**
-
-You'll see detailed logs like:
-```
-🔍 PREDICTION REQUEST RECEIVED
-✓ All required components loaded
-✓ Label Studio tags retrieved successfully
-📝 Input type: <class 'list'>
-📊 Successfully extracted 1 text(s) for processing
-🔤 Tokenizing 1 text(s)...
-✓ Tokenization complete - Shape: torch.Size([1, 256])
-🖥️  Using device: cpu
-✓ Level 1 model ready
-✓ Level 2 model ready
-✓ Level 3 model ready
-🚀 Starting inference...
-   Processing batch 1/1...
-   ✓ Level 1 predictions: ['Internet Banking']
-   ✓ Level 2 prediction: Internet Banking > Account Access
-   ✓ Level 3 prediction: Internet Banking > Account Access > Unblock
-✅ INFERENCE COMPLETE - Generated 3 predictions
