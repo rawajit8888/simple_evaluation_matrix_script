@@ -733,3 +733,84 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
             
             # Return empty list instead of crashing
             return []
+
+
+# change logic for level 3 training
+
+# ========== LEVEL 3: QUERY TYPE ==========
+                                        if self.querytype_model is not None:
+                                            try:
+                                                conditional_text_qt = (
+                                                    f"MasterDepartment: {decoded_masterdept_preds[i]} "
+                                                    f"Department: {department_label} "
+                                                    f"Email: {current_text}"
+                                                )
+
+                                                qt_ids = tokenizer.encode(
+                                                    conditional_text_qt,
+                                                    add_special_tokens=True,
+                                                    max_length=256,
+                                                    truncation=True
+                                                )
+                                                qt_mask = [int(t > 0) for t in qt_ids]
+
+                                                qt_logits = self.querytype_model(
+                                                    torch.tensor([qt_ids]).to(device),
+                                                    torch.tensor([qt_mask]).to(device)
+                                                )
+
+                                                if isinstance(qt_logits, (tuple, list)):
+                                                    qt_logits = qt_logits[0]
+
+                                                qt_probs = torch.softmax(qt_logits, dim=1)
+                                                
+                                                # ========== HIERARCHICAL CONSTRAINT ==========
+                                                qt_encoder = self.querytype_model.get_encoder()
+                                                all_querytypes = qt_encoder.classes_
+                                                
+                                                # Filter to only QueryTypes that start with current department
+                                                valid_indices = []
+                                                valid_labels = []
+                                                
+                                                for idx, qt_label in enumerate(all_querytypes):
+                                                    if qt_label.startswith(department_label):
+                                                        valid_indices.append(idx)
+                                                        valid_labels.append(qt_label)
+                                                
+                                                if len(valid_indices) == 0:
+                                                    self.logger.warning(f"⚠️  No QueryTypes found for department: {department_label}")
+                                                    continue
+                                                
+                                                # Get probabilities only for valid indices
+                                                valid_probs = qt_probs[0][valid_indices]
+                                                
+                                                # Find the highest probability among valid options
+                                                best_valid_idx = torch.argmax(valid_probs).item()
+                                                qt_idx = valid_indices[best_valid_idx]
+                                                querytype_label = valid_labels[best_valid_idx]
+                                                final_score = valid_probs[best_valid_idx].item()
+                                                
+                                                # Log the constraint application
+                                                original_prediction_idx = torch.argmax(qt_probs, dim=1).item()
+                                                original_prediction = all_querytypes[original_prediction_idx]
+                                                
+                                                if original_prediction_idx != qt_idx:
+                                                    self.logger.warning(f"⚠️  Hierarchical constraint applied!")
+                                                    self.logger.warning(f"   Original: {original_prediction} ({qt_probs[0][original_prediction_idx].item():.3f})")
+                                                    self.logger.warning(f"   Corrected: {querytype_label} ({final_score:.3f})")
+                                                else:
+                                                    self.logger.info(f"   ✓ Level 3: {querytype_label} ({final_score:.3f})")
+
+                                                predictions.append({
+                                                    "from_name": from_name_querytype,
+                                                    "to_name": to_name_querytype,
+                                                    "type": "taxonomy",
+                                                    "value": {
+                                                        "taxonomy": [querytype_label.split(" > ")],
+                                                        "score": float(final_score)
+                                                    }
+                                                })
+                                                
+                                            except Exception as e:
+                                                self.logger.error(f"❌ Error in Level 3 prediction for item {i}: {e}")
+                                                self.logger.exception("Full traceback:")
