@@ -814,3 +814,85 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
                                             except Exception as e:
                                                 self.logger.error(f"❌ Error in Level 3 prediction for item {i}: {e}")
                                                 self.logger.exception("Full traceback:")
+
+
+
+
+
+#changed logic for level 2 predictions
+if self.department_model is not None:
+                                        try:
+                                            conditional_text = (
+                                                f"MasterDepartment: {decoded_masterdept_preds[i]} "
+                                                f"Email: {current_text}"
+                                            )
+
+                                            dept_ids = tokenizer.encode(
+                                                conditional_text,
+                                                add_special_tokens=True,
+                                                max_length=256,
+                                                truncation=True
+                                            )
+                                            dept_mask = [int(t > 0) for t in dept_ids]
+
+                                            dept_logits = self.department_model(
+                                                torch.tensor([dept_ids]).to(device),
+                                                torch.tensor([dept_mask]).to(device)
+                                            )
+
+                                            if isinstance(dept_logits, (tuple, list)):
+                                                dept_logits = dept_logits[0]
+
+                                            dept_probs = torch.softmax(dept_logits, dim=1)
+                                            
+                                            # ========== HIERARCHICAL CONSTRAINT FOR LEVEL 2 ==========
+                                            dept_encoder = self.department_model.get_encoder()
+                                            all_departments = dept_encoder.classes_
+                                            
+                                            current_masterdept = decoded_masterdept_preds[i]
+                                            
+                                            # Filter to only Departments that start with current MasterDepartment
+                                            valid_indices = []
+                                            valid_labels = []
+                                            
+                                            for idx, dept_label in enumerate(all_departments):
+                                                if dept_label.startswith(current_masterdept):
+                                                    valid_indices.append(idx)
+                                                    valid_labels.append(dept_label)
+                                            
+                                            if len(valid_indices) == 0:
+                                                self.logger.warning(f"⚠️  No Departments found for MasterDepartment: {current_masterdept}")
+                                                continue
+                                            
+                                            # Get probabilities only for valid indices
+                                            valid_probs = dept_probs[0][valid_indices]
+                                            
+                                            # Find the highest probability among valid options
+                                            best_valid_idx = torch.argmax(valid_probs).item()
+                                            dept_idx = valid_indices[best_valid_idx]
+                                            department_label = valid_labels[best_valid_idx]
+                                            final_score = valid_probs[best_valid_idx].item()
+                                            
+                                            # Log the constraint application
+                                            original_prediction_idx = torch.argmax(dept_probs, dim=1).item()
+                                            original_prediction = all_departments[original_prediction_idx]
+                                            
+                                            if original_prediction_idx != dept_idx:
+                                                self.logger.warning(f"⚠️  Hierarchical constraint applied at Level 2!")
+                                                self.logger.warning(f"   MasterDepartment: {current_masterdept}")
+                                                self.logger.warning(f"   Original: {original_prediction} ({dept_probs[0][original_prediction_idx].item():.3f})")
+                                                self.logger.warning(f"   Corrected: {department_label} ({final_score:.3f})")
+                                            else:
+                                                self.logger.info(f"   ✓ Level 2: {department_label} ({final_score:.3f})")
+
+                                            predictions.append({
+                                                "from_name": from_name_department,
+                                                "to_name": to_name_department,
+                                                "type": "taxonomy",
+                                                "value": {
+                                                    "taxonomy": [department_label.split(" > ")],
+                                                    "score": float(final_score)
+                                                }
+                                            })
+                                            
+                                            self.logger.info(f"   ✓ Level 2 prediction: {department_label}")
