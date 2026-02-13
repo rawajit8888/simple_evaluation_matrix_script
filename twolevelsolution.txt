@@ -820,7 +820,8 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
 
 
 #changed logic for level 2 predictions
-if self.department_model is not None:
+# ========== LEVEL 2: DEPARTMENT ==========
+                                    if self.department_model is not None:
                                         try:
                                             conditional_text = (
                                                 f"MasterDepartment: {decoded_masterdept_preds[i]} "
@@ -896,3 +897,4 @@ if self.department_model is not None:
                                             })
                                             
                                             self.logger.info(f"   ✓ Level 2 prediction: {department_label}")
+
