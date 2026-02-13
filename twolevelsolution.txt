@@ -171,3 +171,180 @@ def fit(self, event, data, tasks, **kwargs):
         self.logger.info("=" * 80)
         self.logger.info("🎉 3-LEVEL HIERARCHICAL TRAINING COMPLETE")
         self.logger.info("=" * 80)
+
+
+
+
+
+
+
+#evaluatin matrix save to folder 
+
+def save_evaluation_to_files(self, level, level_name, test_df, true_labels, pred_labels, accuracy, f1):
+        """
+        Save evaluation results to files:
+        - CSV with test predictions
+        - Text file with classification report
+        - Text file with confusion matrix
+        """
+        from sklearn.metrics import classification_report, confusion_matrix
+        
+        # Create evaluation folder
+        eval_dir = os.path.join(self.model_dir, "evaluation", level_name)
+        os.makedirs(eval_dir, exist_ok=True)
+        
+        self.logger.info(f"📁 Creating evaluation folder: {eval_dir}")
+        
+        # ========== SAVE TEST PREDICTIONS TO CSV ==========
+        predictions_df = test_df.copy()
+        predictions_df['true_label'] = true_labels
+        predictions_df['predicted_label'] = pred_labels
+        predictions_df['correct'] = predictions_df['true_label'] == predictions_df['predicted_label']
+        
+        csv_path = os.path.join(eval_dir, f"{level_name}_test_predictions.csv")
+        predictions_df.to_csv(csv_path, index=False)
+        self.logger.info(f"💾 Test predictions saved to: {csv_path}")
+        
+        # ========== SAVE CLASSIFICATION REPORT ==========
+        report = classification_report(true_labels, pred_labels, zero_division=0)
+        report_path = os.path.join(eval_dir, f"{level_name}_classification_report.txt")
+        
+        with open(report_path, 'w') as f:
+            f.write(f"=" * 80 + "\n")
+            f.write(f"CLASSIFICATION REPORT - {level_name.upper()}\n")
+            f.write(f"=" * 80 + "\n")
+            f.write(f"Overall Accuracy: {accuracy:.4f}\n")
+            f.write(f"Overall F1-Score: {f1:.4f}\n")
+            f.write(f"=" * 80 + "\n\n")
+            f.write(report)
+        
+        self.logger.info(f"💾 Classification report saved to: {report_path}")
+        
+        # ========== SAVE CONFUSION MATRIX ==========
+        cm = confusion_matrix(true_labels, pred_labels)
+        cm_path = os.path.join(eval_dir, f"{level_name}_confusion_matrix.txt")
+        
+        with open(cm_path, 'w') as f:
+            f.write(f"=" * 80 + "\n")
+            f.write(f"CONFUSION MATRIX - {level_name.upper()}\n")
+            f.write(f"=" * 80 + "\n\n")
+            f.write(str(cm))
+            f.write("\n")
+        
+        self.logger.info(f"💾 Confusion matrix saved to: {cm_path}")
+        
+        # ========== SAVE SUMMARY ==========
+        summary_path = os.path.join(eval_dir, f"{level_name}_summary.txt")
+        
+        with open(summary_path, 'w') as f:
+            f.write(f"=" * 80 + "\n")
+            f.write(f"EVALUATION SUMMARY - {level_name.upper()}\n")
+            f.write(f"=" * 80 + "\n")
+            f.write(f"Level: {level}\n")
+            f.write(f"Training samples: {len(test_df)}\n")
+            f.write(f"Accuracy: {accuracy:.4f}\n")
+            f.write(f"F1-Score: {f1:.4f}\n")
+            f.write(f"Number of classes: {len(set(true_labels))}\n")
+            f.write(f"Correct predictions: {sum(predictions_df['correct'])}\n")
+            f.write(f"Incorrect predictions: {sum(~predictions_df['correct'])}\n")
+            f.write(f"=" * 80 + "\n")
+        
+        self.logger.info(f"💾 Summary saved to: {summary_path}")
+        self.logger.info(f"✅ Evaluation files created in: {eval_dir}")
+
+
+
+
+
+# Save evaluation to files
+        self.save_evaluation_to_files(
+            level=1,
+            level_name="masterdepartment",
+            test_df=test_df,
+            true_labels=decoded_masterdept_true,
+            pred_labels=decoded_masterdept_pred,
+            accuracy=masterdept_accuracy,
+            f1=masterdept_f1
+        )
+
+
+
+
+
+
+
+
+
+
+# Save evaluation to files
+        self.save_evaluation_to_files(
+            level=2,
+            level_name="department",
+            test_df=test_df,
+            true_labels=decoded_dept_true,
+            pred_labels=decoded_dept_pred,
+            accuracy=dept_accuracy,
+            f1=dept_f1
+        )
+
+
+
+
+
+
+
+
+
+
+
+# Save evaluation to files
+        self.save_evaluation_to_files(
+            level=3,
+            level_name="querytype",
+            test_df=test_df,
+            true_labels=decoded_qt_true,
+            pred_labels=decoded_qt_pred,
+            accuracy=qt_accuracy,
+            f1=qt_f1
+        )
+```
+
+---
+
+## **Summary of Changes:**
+
+**1. Line ~768**: Add the new `save_evaluation_to_files()` method (65 lines)
+
+**2. Line 1352**: Add evaluation file saving call for Level 1
+
+**3. Line 1489**: Add evaluation file saving call for Level 2
+
+**4. Line 1626**: Add evaluation file saving call for Level 3
+
+---
+
+## **What This Creates:**
+
+After training, you'll get this folder structure:
+```
+./results/bert-classification-sentiment3level_training/
+├── evaluation/
+│   ├── masterdepartment/
+│   │   ├── masterdepartment_test_predictions.csv
+│   │   ├── masterdepartment_classification_report.txt
+│   │   ├── masterdepartment_confusion_matrix.txt
+│   │   └── masterdepartment_summary.txt
+│   ├── department/
+│   │   ├── department_test_predictions.csv
+│   │   ├── department_classification_report.txt
+│   │   ├── department_confusion_matrix.txt
+│   │   └── department_summary.txt
+│   └── querytype/
+│       ├── querytype_test_predictions.csv
+│       ├── querytype_classification_report.txt
+│       ├── querytype_confusion_matrix.txt
+│       └── querytype_summary.txt
+├── metrics.db  (SQLite database - still created)
+├── masterdepartment_model/
+├── department_model/
+└── querytype_model/
