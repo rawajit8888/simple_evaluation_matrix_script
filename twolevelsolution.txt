@@ -1233,6 +1233,25 @@ else:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _train_level1(self, train_df, test_df):
     """Train Level 1: MasterDepartment ONLY"""
     
@@ -1395,5 +1414,46 @@ self.logger.info("✅ Level 3 evaluation complete")
             
             save_path = os.path.join(self.model_dir, "querytype_model")
             model.save(save_path)
+
+
+
             
             self.logger.info(f"💾 Level 3 model saved to {save_path} (without evaluation)")
+
+
+
+
+
+
+
+
+
+
+#to check if level 1 already exists then start traing level 2 
+# ========== TRAIN LEVEL 1: MasterDepartment ONLY ==========
+self.logger.info("")
+self.logger.info("=" * 80)
+self.logger.info("🎯 LEVEL 1 TRAINING: MasterDepartment ONLY")
+self.logger.info("=" * 80)
+
+# Check if Level 1 model already exists
+level1_model_path = os.path.join(self.model_dir, self.finetuned_model_name)
+level1_classifier_exists = os.path.exists(os.path.join(level1_model_path, 'masterdepartment_classifier.pth'))
+level1_weights_exists = os.path.exists(os.path.join(level1_model_path, 'model.safetensors'))
+level1_encoder_exists = os.path.exists(os.path.join(level1_model_path, 'masterdepartment_encoder.pkl'))
+
+level1_model_exists = level1_classifier_exists and level1_weights_exists and level1_encoder_exists
+
+if level1_model_exists:
+    self.logger.info("=" * 80)
+    self.logger.info("✅ LEVEL 1 MODEL ALREADY EXISTS - SKIPPING TRAINING")
+    self.logger.info("=" * 80)
+    self.logger.info(f"📁 Model path: {level1_model_path}")
+    self.logger.info(f"   ✓ masterdepartment_classifier.pth")
+    self.logger.info(f"   ✓ model.safetensors")
+    self.logger.info(f"   ✓ masterdepartment_encoder.pkl")
+    self.logger.info("💡 To retrain Level 1: Delete the masterdepartment_model folder")
+    self.logger.info("=" * 80)
+else:
+    # Smart split: Keep single-sample classes in training only
+    class_counts = df['masterdepartment'].value_counts()
