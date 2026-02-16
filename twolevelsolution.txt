@@ -898,3 +898,502 @@ def predict(self, tasks: List[Dict], texts: str, context: Optional[Dict] = None,
                                             
                                             self.logger.info(f"   ✓ Level 2 prediction: {department_label}")
 
+                                            # ========== LEVEL 3: QUERY TYPE ==========
+                                            if self.querytype_model is not None:
+                                                try:
+                                                    conditional_text_qt = (
+                                                        f"MasterDepartment: {decoded_masterdept_preds[i]} "
+                                                        f"Department: {department_label} "
+                                                        f"Email: {current_text}"
+                                                    )
+
+                                                    qt_ids = tokenizer.encode(
+                                                        conditional_text_qt,
+                                                        add_special_tokens=True,
+                                                        max_length=256,
+                                                        truncation=True
+                                                    )
+                                                    qt_mask = [int(t > 0) for t in qt_ids]
+
+                                                    qt_logits = self.querytype_model(
+                                                        torch.tensor([qt_ids]).to(device),
+                                                        torch.tensor([qt_mask]).to(device)
+                                                    )
+
+                                                    if isinstance(qt_logits, (tuple, list)):
+                                                        qt_logits = qt_logits[0]
+
+                                                    qt_probs = torch.softmax(qt_logits, dim=1)
+                                                    
+                                                    # ========== HIERARCHICAL CONSTRAINT FOR LEVEL 3 ==========
+                                                    qt_encoder = self.querytype_model.get_encoder()
+                                                    all_querytypes = qt_encoder.classes_
+                                                    
+                                                    # Filter to only QueryTypes that start with current department
+                                                    valid_indices = []
+                                                    valid_labels = []
+                                                    
+                                                    for idx, qt_label in enumerate(all_querytypes):
+                                                        if qt_label.startswith(department_label):
+                                                            valid_indices.append(idx)
+                                                            valid_labels.append(qt_label)
+                                                    
+                                                    if len(valid_indices) == 0:
+                                                        self.logger.warning(f"⚠️  No QueryTypes found for department: {department_label}")
+                                                        continue
+                                                    
+                                                    # Get probabilities only for valid indices
+                                                    valid_probs = qt_probs[0][valid_indices]
+                                                    
+                                                    # Find the highest probability among valid options
+                                                    best_valid_idx = torch.argmax(valid_probs).item()
+                                                    qt_idx = valid_indices[best_valid_idx]
+                                                    querytype_label = valid_labels[best_valid_idx]
+                                                    final_score = valid_probs[best_valid_idx].item()
+                                                    
+                                                    # Log the constraint application
+                                                    original_prediction_idx = torch.argmax(qt_probs, dim=1).item()
+                                                    original_prediction = all_querytypes[original_prediction_idx]
+                                                    
+                                                    if original_prediction_idx != qt_idx:
+                                                        self.logger.warning(f"⚠️  Hierarchical constraint applied at Level 3!")
+                                                        self.logger.warning(f"   Department: {department_label}")
+                                                        self.logger.warning(f"   Original: {original_prediction} ({qt_probs[0][original_prediction_idx].item():.3f})")
+                                                        self.logger.warning(f"   Corrected: {querytype_label} ({final_score:.3f})")
+                                                    else:
+                                                        self.logger.info(f"   ✓ Level 3: {querytype_label} ({final_score:.3f})")
+
+                                                    predictions.append({
+                                                        "from_name": from_name_querytype,
+                                                        "to_name": to_name_querytype,
+                                                        "type": "taxonomy",
+                                                        "value": {
+                                                            "taxonomy": [querytype_label.split(" > ")],
+                                                            "score": float(final_score)
+                                                        }
+                                                    })
+                                                    
+                                                except Exception as e:
+                                                    self.logger.error(f"❌ Error in Level 3 prediction for item {i}: {e}")
+                                                    self.logger.exception("Full traceback:")
+                                                    
+                                        except Exception as e:
+                                            self.logger.error(f"❌ Error in Level 2 prediction for item {i}: {e}")
+                                            self.logger.exception("Full traceback:")
+```
+
+---
+
+## **Now Your Predictions Will Be:**
+
+### **Before (Wrong):**
+```
+Level 1: Internet Banking
+Level 2: Mobile Banking > App ❌
+Level 3: Mobile Banking > App > Unable to login ❌
+```
+
+### **After (Correct):**
+```
+Level 1: Internet Banking
+Level 2: Internet Banking > Account Access ✅ (Corrected from "Mobile Banking > App")
+Level 3: Internet Banking > Account Access > Unable to login ✅ (Now correct parent)
+```
+
+---
+
+## **What You'll See in Logs:**
+```
+✓ Level 1 predictions: ['Internet Banking']
+⚠️  Hierarchical constraint applied at Level 2!
+   MasterDepartment: Internet Banking
+   Original prediction: Mobile Banking > App (score: 0.652)
+   Corrected to: Internet Banking > Account Access (score: 0.487)
+✓ Level 2: Internet Banking > Account Access (score: 0.487)
+⚠️  Hierarchical constraint applied at Level 3!
+   Department: Internet Banking > Account Access
+   Original: Mobile Banking > App > Unable to login (score: 0.701)
+   Corrected: Internet Banking > Account Access > Unable to login (score: 0.534)
+✓ Level 3: Internet Banking > Account Access > Unable to login (score: 0.534)
+
+
+
+
+
+
+# Level 1 training were getting completed sucessfuly but not level 2 due so some lablesl which has 1 data each so we needed
+to change train -test split logic 
+
+
+
+# ========== TRAIN LEVEL 1: MasterDepartment ONLY ==========
+self.logger.info("")
+self.logger.info("=" * 80)
+self.logger.info("🎯 LEVEL 1 TRAINING: MasterDepartment ONLY")
+self.logger.info("=" * 80)
+
+# Smart split: Keep single-sample classes in training only
+class_counts = df['masterdepartment'].value_counts()
+single_sample_classes = class_counts[class_counts == 1].index.tolist()
+multi_sample_classes = class_counts[class_counts >= 2].index.tolist()
+
+self.logger.info(f"📊 Classes with 1 sample: {len(single_sample_classes)} (will be in training only)")
+self.logger.info(f"📊 Classes with 2+ samples: {len(multi_sample_classes)} (will be split)")
+
+# Separate single-sample data (goes to training only)
+single_sample_df = df[df['masterdepartment'].isin(single_sample_classes)]
+
+# Separate multi-sample data (will be split)
+multi_sample_df = df[df['masterdepartment'].isin(multi_sample_classes)]
+
+if len(multi_sample_df) > 0:
+    # Split only the multi-sample data
+    min_samples = multi_sample_df['masterdepartment'].value_counts().min()
+    
+    if min_samples >= 2:
+        self.logger.info(f"✓ Using stratified split for multi-sample classes")
+        try:
+            level1_train_multi, level1_test_df = train_test_split(
+                multi_sample_df, test_size=0.2, random_state=42,
+                stratify=multi_sample_df['masterdepartment']
+            )
+        except ValueError as e:
+            self.logger.warning(f"⚠️  Stratified split failed: {e}")
+            self.logger.warning("⚠️  Falling back to random split")
+            level1_train_multi, level1_test_df = train_test_split(
+                multi_sample_df, test_size=0.2, random_state=42
+            )
+    else:
+        # Shouldn't happen, but handle it
+        level1_train_multi, level1_test_df = train_test_split(
+            multi_sample_df, test_size=0.2, random_state=42
+        )
+    
+    # Combine: all single-sample + training portion of multi-sample
+    level1_train_df = pd.concat([single_sample_df, level1_train_multi], ignore_index=True)
+else:
+    # All classes have only 1 sample
+    level1_train_df = single_sample_df
+    level1_test_df = pd.DataFrame(columns=df.columns)  # Empty test set
+    self.logger.warning("⚠️  All classes have only 1 sample - no test set will be created")
+
+self.logger.info(f"📊 Level 1 - Train: {len(level1_train_df)} | Test: {len(level1_test_df)}")
+self._train_level1(level1_train_df, level1_test_df)
+
+
+
+
+
+
+
+
+# ========== TRAIN LEVEL 2: Department ==========
+self.logger.info("")
+self.logger.info("=" * 80)
+self.logger.info("🎯 LEVEL 2 TRAINING: Department")
+self.logger.info("=" * 80)
+
+# Filter samples with department labels FIRST
+dept_df = df[df['department'].notna()].copy()
+
+if len(dept_df) > 0:
+    self.logger.info(f"📊 Department samples: {len(dept_df)}")
+    
+    # Smart split: Keep single-sample classes in training only
+    dept_class_counts = dept_df['department'].value_counts()
+    dept_single_sample_classes = dept_class_counts[dept_class_counts == 1].index.tolist()
+    dept_multi_sample_classes = dept_class_counts[dept_class_counts >= 2].index.tolist()
+    
+    self.logger.info(f"📊 Departments with 1 sample: {len(dept_single_sample_classes)} (will be in training only)")
+    self.logger.info(f"📊 Departments with 2+ samples: {len(dept_multi_sample_classes)} (will be split)")
+    
+    # Separate single-sample data
+    dept_single_sample_df = dept_df[dept_df['department'].isin(dept_single_sample_classes)]
+    
+    # Separate multi-sample data
+    dept_multi_sample_df = dept_df[dept_df['department'].isin(dept_multi_sample_classes)]
+    
+    if len(dept_multi_sample_df) > 0:
+        # Split only the multi-sample data
+        dept_min_samples = dept_multi_sample_df['department'].value_counts().min()
+        
+        if dept_min_samples >= 2:
+            self.logger.info(f"✓ Using stratified split for departments")
+            try:
+                dept_train_multi, dept_test_df = train_test_split(
+                    dept_multi_sample_df, test_size=0.2, random_state=42,
+                    stratify=dept_multi_sample_df['department']
+                )
+            except ValueError as e:
+                self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                self.logger.warning("⚠️  Falling back to random split")
+                dept_train_multi, dept_test_df = train_test_split(
+                    dept_multi_sample_df, test_size=0.2, random_state=42
+                )
+        else:
+            dept_train_multi, dept_test_df = train_test_split(
+                dept_multi_sample_df, test_size=0.2, random_state=42
+            )
+        
+        # Combine: all single-sample + training portion of multi-sample
+        dept_train_df = pd.concat([dept_single_sample_df, dept_train_multi], ignore_index=True)
+    else:
+        # All departments have only 1 sample
+        dept_train_df = dept_single_sample_df
+        dept_test_df = pd.DataFrame(columns=dept_df.columns)
+        self.logger.warning("⚠️  All departments have only 1 sample - no test set will be created")
+    
+    self.logger.info(f"📊 Level 2 - Train: {len(dept_train_df)} | Test: {len(dept_test_df)}")
+    self._train_level2(dept_train_df, dept_test_df)
+else:
+    self.logger.warning("⚠️  No Department labels found - skipping Level 2 training")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ========== TRAIN LEVEL 3: QueryType ==========
+self.logger.info("")
+self.logger.info("=" * 80)
+self.logger.info("🎯 LEVEL 3 TRAINING: QueryType")
+self.logger.info("=" * 80)
+
+# Filter samples with querytype labels FIRST
+qt_df = df[df['querytype'].notna()].copy()
+
+if len(qt_df) > 0:
+    self.logger.info(f"📊 QueryType samples: {len(qt_df)}")
+    
+    # Smart split: Keep single-sample classes in training only
+    qt_class_counts = qt_df['querytype'].value_counts()
+    qt_single_sample_classes = qt_class_counts[qt_class_counts == 1].index.tolist()
+    qt_multi_sample_classes = qt_class_counts[qt_class_counts >= 2].index.tolist()
+    
+    self.logger.info(f"📊 QueryTypes with 1 sample: {len(qt_single_sample_classes)} (will be in training only)")
+    self.logger.info(f"📊 QueryTypes with 2+ samples: {len(qt_multi_sample_classes)} (will be split)")
+    
+    # Separate single-sample data
+    qt_single_sample_df = qt_df[qt_df['querytype'].isin(qt_single_sample_classes)]
+    
+    # Separate multi-sample data
+    qt_multi_sample_df = qt_df[qt_df['querytype'].isin(qt_multi_sample_classes)]
+    
+    if len(qt_multi_sample_df) > 0:
+        # Split only the multi-sample data
+        qt_min_samples = qt_multi_sample_df['querytype'].value_counts().min()
+        
+        if qt_min_samples >= 2:
+            self.logger.info(f"✓ Using stratified split for querytypes")
+            try:
+                qt_train_multi, qt_test_df = train_test_split(
+                    qt_multi_sample_df, test_size=0.2, random_state=42,
+                    stratify=qt_multi_sample_df['querytype']
+                )
+            except ValueError as e:
+                self.logger.warning(f"⚠️  Stratified split failed: {e}")
+                self.logger.warning("⚠️  Falling back to random split")
+                qt_train_multi, qt_test_df = train_test_split(
+                    qt_multi_sample_df, test_size=0.2, random_state=42
+                )
+        else:
+            qt_train_multi, qt_test_df = train_test_split(
+                qt_multi_sample_df, test_size=0.2, random_state=42
+            )
+        
+        # Combine: all single-sample + training portion of multi-sample
+        qt_train_df = pd.concat([qt_single_sample_df, qt_train_multi], ignore_index=True)
+    else:
+        # All querytypes have only 1 sample
+        qt_train_df = qt_single_sample_df
+        qt_test_df = pd.DataFrame(columns=qt_df.columns)
+        self.logger.warning("⚠️  All querytypes have only 1 sample - no test set will be created")
+    
+    self.logger.info(f"📊 Level 3 - Train: {len(qt_train_df)} | Test: {len(qt_test_df)}")
+    self._train_level3(qt_train_df, qt_test_df)
+else:
+    self.logger.warning("⚠️  No QueryType labels found - skipping Level 3 training")
+
+
+
+
+
+
+
+
+
+
+def _train_level1(self, train_df, test_df):
+    """Train Level 1: MasterDepartment ONLY"""
+    
+    from sklearn.preprocessing import LabelEncoder
+    
+    # Check if we have test data
+    has_test_data = len(test_df) > 0
+    if not has_test_data:
+        self.logger.warning("⚠️  No test data available - will train without evaluation")
+    
+    # Encode labels
+    masterdept_encoder = LabelEncoder()
+
+
+
+# ========== EVALUATION ==========
+training_logger.end_training()
+        
+        # ========== EVALUATION ==========
+        if has_test_data:
+            self.logger.info("")
+            self.logger.info("📊 Evaluating Level 1 model...")
+            
+            try:
+                model.eval()
+
+
+
+self.logger.info("✅ Level 1 evaluation complete")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error during Level 1 evaluation: {e}")
+                self.logger.exception("Full traceback:")
+                raise
+        else:
+            # No test data - skip evaluation but still save model
+            self.logger.warning("⚠️  Skipping evaluation - no test data available")
+            
+            # Save model without evaluation
+            model.set_encoder(masterdept_encoder)
+            
+            save_path = os.path.join(self.model_dir, self.finetuned_model_name)
+            model.save(save_path)
+            
+            # Save tokenizer
+            tokenizer.save_pretrained(save_path)
+            
+            self.logger.info(f"💾 Level 1 model saved to {save_path} (without evaluation)")
+
+
+
+
+
+
+def _train_level2(self, train_df, test_df):
+    """Train Level 2: Department (conditioned on MasterDepartment)"""
+    
+    from sklearn.preprocessing import LabelEncoder
+    
+    # Check if we have test data
+    has_test_data = len(test_df) > 0
+    if not has_test_data:
+        self.logger.warning("⚠️  No test data available - will train Level 2 without evaluation")
+    
+    # Encode labels
+    dept_encoder = LabelEncoder()
+
+
+
+
+training_logger.end_training()
+        
+        # ========== EVALUATION ==========
+        if has_test_data:
+            self.logger.info("")
+            self.logger.info("📊 Evaluating Level 2 model...")
+            
+            try:
+                model.eval()
+
+
+
+
+
+
+self.logger.info("✅ Level 2 evaluation complete")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error during Level 2 evaluation: {e}")
+                self.logger.exception("Full traceback:")
+                raise
+        else:
+            # No test data - skip evaluation but still save model
+            self.logger.warning("⚠️  Skipping Level 2 evaluation - no test data available")
+            
+            # Save model without evaluation
+            model.set_encoder(dept_encoder)
+            
+            save_path = os.path.join(self.model_dir, "department_model")
+            model.save(save_path)
+            
+            self.logger.info(f"💾 Level 2 model saved to {save_path} (without evaluation)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _train_level3(self, train_df, test_df):
+    """Train Level 3: QueryType (conditioned on MasterDepartment + Department)"""
+    
+    from sklearn.preprocessing import LabelEncoder
+    
+    # Check if we have test data
+    has_test_data = len(test_df) > 0
+    if not has_test_data:
+        self.logger.warning("⚠️  No test data available - will train Level 3 without evaluation")
+    
+    # Encode labels
+    qt_encoder = LabelEncoder()
+
+
+
+training_logger.end_training()
+        
+        # ========== EVALUATION ==========
+        if has_test_data:
+            self.logger.info("")
+            self.logger.info("📊 Evaluating Level 3 model...")
+            
+            try:
+                model.eval()
+
+
+
+
+self.logger.info("✅ Level 3 evaluation complete")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error during Level 3 evaluation: {e}")
+                self.logger.exception("Full traceback:")
+                raise
+        else:
+            # No test data - skip evaluation but still save model
+            self.logger.warning("⚠️  Skipping Level 3 evaluation - no test data available")
+            
+            # Save model without evaluation
+            model.set_encoder(qt_encoder)
+            
+            save_path = os.path.join(self.model_dir, "querytype_model")
+            model.save(save_path)
+            
+            self.logger.info(f"💾 Level 3 model saved to {save_path} (without evaluation)")
