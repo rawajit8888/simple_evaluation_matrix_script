@@ -1457,3 +1457,66 @@ if level1_model_exists:
 else:
     # Smart split: Keep single-sample classes in training only
     class_counts = df['masterdepartment'].value_counts()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#open matrix.db files
+import sqlite3
+
+# CHANGE THIS TO YOUR ACTUAL PATH
+db_path = "./results/bert-classification-sentiment3level_training/metrics.db"
+
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+
+# ===== SHOW ALL TABLES =====
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+tables = cursor.fetchall()
+print("TABLES:", tables)
+
+# ===== SHOW ALL RUNS =====
+print("\n" + "=" * 60)
+print("ALL TRAINING RUNS")
+print("=" * 60)
+cursor.execute("SELECT * FROM runs ORDER BY run_id DESC")
+rows = cursor.fetchall()
+cursor.execute("PRAGMA table_info(runs)")
+cols = [col[1] for col in cursor.fetchall()]
+print(" | ".join(cols))
+print("-" * 60)
+for row in rows:
+    print(" | ".join(str(x) for x in row))
+
+# ===== SHOW ALL METRICS =====
+print("\n" + "=" * 60)
+print("ALL METRICS")
+print("=" * 60)
+cursor.execute("""
+    SELECT task, metric, ROUND(value, 4) as value 
+    FROM metrics 
+    WHERE run_id = (SELECT MAX(run_id) FROM runs)
+    ORDER BY task, metric
+""")
+rows = cursor.fetchall()
+print(f"{'TASK':<15} | {'METRIC':<40} | {'VALUE'}")
+print("-" * 60)
+for row in rows:
+    print(f"{str(row[0]):<15} | {str(row[1]):<40} | {row[2]}")
+
+conn.close()
+print("\n✅ Done!")
