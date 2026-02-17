@@ -1520,3 +1520,50 @@ for row in rows:
 
 conn.close()
 print("\n✅ Done!")
+
+
+
+
+
+
+
+
+
+
+
+
+#write to excel
+
+
+import sqlite3
+import pandas as pd
+
+# YOUR METRICS.DB PATH
+db_path = r"PASTE_YOUR_PATH_HERE\metrics.db"
+
+# OUTPUT EXCEL PATH - will be created in same folder
+excel_path = r"PASTE_YOUR_PATH_HERE\metrics_export.xlsx"
+
+conn = sqlite3.connect(db_path)
+
+# Get all table names
+cursor = conn.cursor()
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+tables = [row[0] for row in cursor.fetchall()]
+
+print(f"📊 Found tables: {tables}")
+print("=" * 60)
+
+# Write each table to a separate Excel sheet
+with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+    
+    for table in tables:
+        df = pd.read_sql(f"SELECT * FROM {table}", conn)
+        df.to_excel(writer, sheet_name=table, index=False)
+        print(f"✅ Written table '{table}' → {len(df)} rows, {len(df.columns)} columns")
+
+conn.close()
+
+print("=" * 60)
+print(f"✅ Excel file saved at: {excel_path}")
+print("📂 Open the file to see all metrics!")
