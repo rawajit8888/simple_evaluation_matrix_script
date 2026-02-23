@@ -715,33 +715,81 @@ class MultiTaskBertModel:
         self.logger.info(f"✓ Metrics database initialized at {db_path}")
     
     def save_metrics_to_sqlite(self, level, accuracy, f1, train_count, test_count):
-        """Save metrics to SQLite database"""
+        """Save overall metrics to SQLite database — returns run_id for use in full report save"""
         import sqlite3
-        
+
         db_path = os.path.join(self.model_dir, "metrics.db")
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor = conn.cursor()
-        
+        conn    = sqlite3.connect(db_path)
+        cursor  = conn.cursor()
+
+        # Insert a new run row and get its ID
+        cursor.execute("""
+            INSERT INTO runs (timestamp, level, train_samples, test_samples)
+            VALUES (?, ?, ?, ?)
+        """, (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, train_count, test_count))
+
+        run_id = cursor.lastrowid
+
+        # Map level number to task name
+        task_name = {1: 'masterdepartment', 2: 'department', 3: 'querytype'}.get(level, f'level{level}')
+
+        # Save top-level accuracy and weighted-F1
+        cursor.executemany("""
+            INSERT INTO metrics (run_id, task, metric, value)
+            VALUES (?, ?, ?, ?)
+        """, [
+            (run_id, task_name, 'accuracy',    accuracy),
+            (run_id, task_name, 'weighted_f1', f1),
+        ])
+
+        conn.commit()
+        conn.close()
+
+        self.logger.info(f"💾 Metrics saved to DB — run_id: {run_id} | level: {level} | "
+                         f"accuracy: {accuracy:.4f} | f1: {f1:.4f}")
+        return run_id
+
+    def save_full_classification_report_to_sqlite(self, run_id, task, y_true, y_pred):
+        """Save per-class precision/recall/f1 from classification_report into metrics DB"""
+        import sqlite3
+
+        if run_id is None:
+            self.logger.warning("⚠️  save_full_classification_report_to_sqlite: run_id is None, skipping")
+            return
+
+        try:
+            report_dict = classification_report(
+                y_true, y_pred,
+                output_dict=True,
+                zero_division=0
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️  Could not generate classification report: {e}")
+            return
+
+        db_path = os.path.join(self.model_dir, "metrics.db")
+        conn    = sqlite3.connect(db_path)
+        cursor  = conn.cursor()
+
         metrics_to_save = []
-        
         for label, metrics in report_dict.items():
             if isinstance(metrics, dict):
                 for metric_name, value in metrics.items():
                     if metric_name in ['precision', 'recall', 'f1-score']:
-                        metric_key = f"{label}_{metric_name.replace('-', '_')}"
-                        metrics_to_save.append((run_id, task, metric_key, value))
-        
-        cursor.executemany("""
-            INSERT INTO metrics (run_id, task, metric, value)
-            VALUES (?, ?, ?, ?)
-        """, metrics_to_save)
-        
+                        metric_key = f"{label}__{metric_name.replace('-', '_')}"
+                        metrics_to_save.append((run_id, task, metric_key, float(value)))
+
+        if metrics_to_save:
+            cursor.executemany("""
+                INSERT INTO metrics (run_id, task, metric, value)
+                VALUES (?, ?, ?, ?)
+            """, metrics_to_save)
+
         conn.commit()
         conn.close()
-        
-        self.logger.info(f"💾 Detailed {task} report saved to database")
+
+        self.logger.info(f"💾 Full classification report saved to DB — task: {task} | "
+                         f"classes saved: {len(metrics_to_save)}")
     
     def get_latest_metrics_from_db(self):
         """Retrieve latest metrics from database"""
