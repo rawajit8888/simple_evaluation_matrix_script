@@ -1,0 +1,24 @@
+else:
+            self.logger.info(f"Feedback class has {feedback_count} samples — no cap needed")
+
+        # ── ADD THIS BLOCK ──────────────────────────────────────────────
+        # Cap dominant Internet Banking class to maintain balance
+        IB_CLASS = 'Internet Banking'
+        IB_CAP   = 1200
+        ib_mask  = df['masterdepartment'] == IB_CLASS
+        ib_count = int(ib_mask.sum())
+        if ib_count > IB_CAP:
+            keep_ib = df[ib_mask].sample(n=IB_CAP, random_state=42)
+            df      = pd.concat([df[~ib_mask], keep_ib], ignore_index=True)
+            self.logger.info("=" * 70)
+            self.logger.info("✂️  INTERNET BANKING CLASS CAP APPLIED")
+            self.logger.info(f"   Class   : {IB_CLASS}")
+            self.logger.info(f"   Before  : {ib_count} samples")
+            self.logger.info(f"   After   : {IB_CAP} samples")
+            self.logger.info(f"   Removed : {ib_count - IB_CAP} (reduces class imbalance)")
+            self.logger.info("=" * 70)
+        else:
+            self.logger.info(f"Internet Banking has {ib_count} samples — no cap needed")
+        # ── END OF IB CAP BLOCK ─────────────────────────────────────────
+
+        from sklearn.model_selection import train_test_split
