@@ -1,0 +1,29 @@
+res.rows.forEach(row => {
+  const values = config.columns.map(col => {
+    let val = row[col.source];
+
+    // 🔥 FIX 1: INT conversion
+    if (col.type === "INT") {
+      val = val !== null && val !== undefined ? Number(val) : null;
+    }
+
+    // 🔥 FIX 2: BOOLEAN conversion
+    if (col.type === "BOOLEAN") {
+      val = val === true ? 1 : 0;
+    }
+
+    // 🔥 FIX 3: DATETIME conversion
+    if (col.type === "DATETIME") {
+      val = val ? new Date(val) : null;
+    }
+
+    // 🔥 FIX 4: STRING safety
+    if (col.type === "VARCHAR") {
+      val = val !== null && val !== undefined ? String(val) : null;
+    }
+
+    return val;
+  });
+
+  table.rows.add(...values);
+});
