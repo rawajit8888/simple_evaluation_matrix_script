@@ -1,0 +1,71 @@
+# =========================
+# ENTITY TOKEN MAP (NEW)
+# =========================
+ENTITY_MAP = {
+    "PERSON": "<NAME>",
+    "EMAIL_ADDRESS": "<EMAIL>",
+    "PHONE_NUMBER": "<MOBILE>",
+    "AADHAR": "<AADHAAR>",
+    "PAN": "<PAN>",
+    "IFSC": "<IFSC>",
+    "BANK_ACC": "<ACCOUNT>",
+    "DP_ACCOUNT": "<ACCOUNT>",
+    "DP_ACCOUNT_CDSL": "<ACCOUNT>",
+    "CIF": "<CIF>",
+    "USER_ID": "<USER_ID>",
+    "TRADING_ID": "<USER_ID>",
+    "URL": "<URL>"
+}
+
+
+
+def mask_text(text):
+    entities_to_mask = [e[0] for e in patterns] + ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS"]
+
+    results = analyzer.analyze(
+        text=text,
+        entities=entities_to_mask,
+        language='en'
+    )
+
+    # Sort reverse (important to avoid index shift issues)
+    results = sorted(results, key=lambda x: x.start, reverse=True)
+
+    masked_text = text
+
+    for r in results:
+        start, end = r.start, r.end
+        original = masked_text[start:end]
+
+        # Skip URLs like www.
+        if original.strip().lower().startswith("www."):
+            continue
+
+        # =========================
+        # PERSON (Indic NER handled)
+        # =========================
+        if r.entity_type == "PERSON":
+            # Expand to full name
+            start = r.start
+            while start > 0 and text[start - 1].isalpha():
+                start -= 1
+
+            end = r.end
+            while end < len(text) and text[end].isalpha():
+                end += 1
+
+            replacement = "<NAME>"
+
+        else:
+            # =========================
+            # OTHER ENTITIES
+            # =========================
+            replacement = ENTITY_MAP.get(r.entity_type, f"<{r.entity_type}>")
+
+        masked_text = masked_text[:start] + replacement + masked_text[end:]
+
+    return masked_text
+
+
+
+
