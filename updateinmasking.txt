@@ -69,3 +69,243 @@ def mask_text(text):
 
 
 
+
+
+
+
+
+import re
+import requests
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from presidio_analyzer import Pattern, PatternRecognizer, AnalyzerEngine, RecognizerRegistry, EntityRecognizer, RecognizerResult
+import json
+import os
+import ssl
+
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+os.environ["CURL_CA_BUNDLE"] = ""
+ssl._create_default_https_context = ssl.SSLContext
+
+# =========================
+# GPU setup
+# =========================
+device = 0 if torch.cuda.is_available() else -1
+print(f"Using device: {'GPU' if device >= 0 else 'CPU'}")
+
+# =========================
+# ENTITY TOKEN MAP
+# =========================
+ENTITY_MAP = {
+    "PERSON": "<NAME>",
+    "EMAIL_ADDRESS": "<EMAIL>",
+    "PHONE_NUMBER": "<MOBILE>",
+    "AADHAR": "<AADHAAR>",
+    "PAN": "<PAN>",
+    "IFSC": "<IFSC>",
+    "BANK_ACC": "<ACCOUNT>",
+    "DP_ACCOUNT": "<ACCOUNT>",
+    "DP_ACCOUNT_CDSL": "<ACCOUNT>",
+    "CIF": "<CIF>",
+    "USER_ID": "<USER_ID>",
+    "TRADING_ID": "<USER_ID>",
+    "DP_ID": "<DP_ID>",
+    "URL": "<URL>"
+}
+
+# =========================
+# Load IndicNER
+# =========================
+model_name = r"E:\FeatSystems\masking_data_label_studio\indicmodel"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+model = AutoModelForTokenClassification.from_pretrained(model_name, local_files_only=True)
+
+ner_pipeline = pipeline(
+    "ner",
+    model=model,
+    tokenizer=tokenizer,
+    aggregation_strategy="simple",
+    device=device
+)
+
+class IndicNERRecognizer(EntityRecognizer):
+    def __init__(self, ner_pipeline, supported_entities=None, name="IndicNERRecognizer"):
+        self.ner_pipeline = ner_pipeline
+        supported_entities = supported_entities or ["PERSON"]
+        super().__init__(supported_entities=supported_entities, name=name)
+
+    def analyze(self, text, entities, nlp_artifacts=None):
+        results = []
+        predictions = self.ner_pipeline(text)
+
+        for p in predictions:
+            if p["entity_group"] == "PER" and "PERSON" in entities:
+                results.append(
+                    RecognizerResult(
+                        entity_type="PERSON",
+                        start=p["start"],
+                        end=p["end"],
+                        score=p["score"]
+                    )
+                )
+        return results
+
+# =========================
+# Load Regex Config
+# =========================
+CONFIG_PATH = r"E:\FeatSystems\masking_data_label_studio\config.json"
+
+patterns = []
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    patterns = [(item["name"], item["regex"]) for item in config.get("patterns", [])]
+else:
+    print(f"Config file not found at {CONFIG_PATH}")
+
+# =========================
+# Register recognizers
+# =========================
+registry = RecognizerRegistry()
+registry.load_predefined_recognizers()
+
+for name, regex in patterns:
+    pattern = Pattern(name=f"{name}_pattern", regex=regex, score=1.0)
+    recognizer = PatternRecognizer(supported_entity=name, patterns=[pattern])
+    registry.add_recognizer(recognizer)
+
+registry.add_recognizer(IndicNERRecognizer(ner_pipeline))
+
+analyzer = AnalyzerEngine(registry=registry)
+
+# =========================
+# MASKING FUNCTION
+# =========================
+def mask_text(text):
+    entities_to_mask = [e[0] for e in patterns] + ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS"]
+
+    results = analyzer.analyze(
+        text=text,
+        entities=entities_to_mask,
+        language='en'
+    )
+
+    # Sort reverse to avoid index issues
+    results = sorted(results, key=lambda x: x.start, reverse=True)
+
+    masked_text = text
+
+    for r in results:
+        start, end = r.start, r.end
+        original = masked_text[start:end]
+
+        # Skip URLs like www.
+        if original.strip().lower().startswith("www."):
+            continue
+
+        # PERSON (Indic NER)
+        if r.entity_type == "PERSON":
+            # Expand full name
+            start = r.start
+            while start > 0 and text[start - 1].isalpha():
+                start -= 1
+
+            end = r.end
+            while end < len(text) and text[end].isalpha():
+                end += 1
+
+            replacement = "<NAME>"
+
+        else:
+            replacement = ENTITY_MAP.get(r.entity_type, f"<{r.entity_type}>")
+
+        masked_text = masked_text[:start] + replacement + masked_text[end:]
+
+    return masked_text
+
+# =========================
+# LABEL STUDIO API
+# =========================
+API_TOKEN = ""
+BASE_URL = "http://localhost:8080/api"
+
+PROXIES = {"http": None}
+
+def get_tasks(project_id, page=1):
+    url = f"{BASE_URL}/tasks/?page={page}&project={project_id}&fields=task_only"
+
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Token {API_TOKEN}"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, proxies=PROXIES, verify=False)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching page {page}: {e}")
+        return []
+
+    data = response.json()
+
+    if isinstance(data, dict):
+        return data.get("results", []) or data.get("tasks", [])
+
+    return data
+
+def update_task(task):
+    task_id = task["id"]
+    original_html = task.get("data", {}).get("html", "")
+
+    masked_html = mask_text(original_html)
+    task["data"]["html"] = masked_html
+
+    url = f"{BASE_URL}/tasks/{task_id}/"
+
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Token {API_TOKEN}"
+    }
+
+    response = requests.patch(
+        url,
+        headers=headers,
+        proxies=PROXIES,
+        json={
+            "data": task["data"],
+            "project": task["project"]
+        }
+    )
+
+    if response.status_code in [200, 201]:
+        print(f"Task {task_id} updated successfully.")
+    else:
+        print(f"Failed to update task {task_id}: {response.status_code} - {response.text}")
+
+def process_project_tasks(project_id):
+    page = 1
+    total_processed = 0
+
+    while True:
+        tasks = get_tasks(project_id, page=page)
+
+        if not tasks:
+            print(f"No more tasks. Total processed: {total_processed}")
+            break
+
+        print(f"Processing page {page} with {len(tasks)} tasks...")
+
+        for task in tasks:
+            update_task(task)
+            total_processed += 1
+
+        page += 1
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    PROJECT_ID = 16
+    process_project_tasks(PROJECT_ID)
