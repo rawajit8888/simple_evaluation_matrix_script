@@ -1,0 +1,74 @@
+{
+  "patterns": [
+    {
+      "name": "DP_ACCOUNT_CDSL",
+      "regex": "\\b\\d{16}\\b",
+      "comment": "Exactly 16-digit CDSL DP account number"
+    },
+    {
+      "name": "DP_ACCOUNT",
+      "regex": "\\b\\d{8}\\b",
+      "comment": "Exactly 8-digit DP account number"
+    },
+    {
+      "name": "BANK_ACC",
+      "regex": "\\b\\d{9,}\\b",
+      "comment": "Bank account number — 9 or more digits (covers 11-digit, 14-digit, 18-digit, any length). Was \\b\\d{14}\\b which missed 11-digit accounts."
+    },
+    {
+      "name": "DP_ID",
+      "regex": "\\bIN\\s*\\d+\\b",
+      "comment": "DP ID starting with IN followed by any number of digits"
+    },
+    {
+      "name": "TRADING_ID",
+      "regex": "(?<!\\d)\\d{6,7}(?!\\d)",
+      "comment": "6-7 digit trading client ID. Negative lookaround prevents false match inside a longer number."
+    },
+    {
+      "name": "PAN",
+      "regex": "\\b[A-Z]{5}[0-9]{4}[A-Z]\\b",
+      "comment": "PAN card — 5 uppercase letters, 4 digits, 1 uppercase letter"
+    },
+    {
+      "name": "AADHAR",
+      "regex": "\\b\\d{4}\\s?\\d{4}\\s?\\d{4}\\b",
+      "comment": "12-digit Aadhaar, optionally space-separated in groups of 4 (e.g. 1234 5678 9012)"
+    },
+    {
+      "name": "IFSC",
+      "regex": "\\b[A-Z]{4}0[A-Z0-9]{6}\\b",
+      "comment": "IFSC code — 4 uppercase letters, literal 0, 6 alphanumeric characters"
+    },
+    {
+      "name": "CIF",
+      "regex": "\\b(?:CIF|cif)\\s*(?:no\\.?|number|#)?\\s*[:\\-]?\\s*\\d+\\b",
+      "comment": "CIF number — keyword CIF/cif required. Digits of any length follow. Supports: CIF 12345678, CIF: 12345678, CIF no. 12345678"
+    },
+    {
+      "name": "CORP_ID",
+      "regex": "\\b(?:CORP(?:\\s*ID)?|corp(?:\\s*id)?|CORPID|corpid)\\s*[:\\-#]?\\s*[A-Z0-9]+\\b",
+      "comment": "Corporate ID — keyword CORP/CORPID required. Value is alphanumeric with NO length limit (any length). Supports: CORP ID ABC123, CORP: XYZ001, CORPID AB9988XYZ"
+    },
+    {
+      "name": "USER_ID",
+      "regex": "\\b(?:USER\\s*ID|user\\s*id|UID|uid)\\s*[:\\-#]?\\s*[A-Z0-9]+\\b",
+      "comment": "User ID — keyword USER ID/UID required. Value is alphanumeric with any length. Supports: USER ID U12345, UID: 456789, userid uid112233"
+    },
+    {
+      "name": "IP_ADDRESS",
+      "regex": "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b",
+      "comment": "IPv4 address"
+    },
+    {
+      "name": "EMAIL_ADDRESS",
+      "regex": "\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b",
+      "comment": "Email address — regex fallback. IndicNER is the primary source for emails."
+    },
+    {
+      "name": "PHONE_NUMBER",
+      "regex": "(?<!\\d)[6-9]\\d{9}(?!\\d)",
+      "comment": "Indian mobile number — 10 digits starting with 6, 7, 8, or 9. Negative lookaround prevents partial matches."
+    }
+  ]
+}
