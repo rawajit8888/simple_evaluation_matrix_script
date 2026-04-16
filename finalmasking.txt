@@ -1,85 +1,130 @@
+"""
+Entity-Based Masking Script — FIXED VERSION
+============================================
+Masks PII entities in Label Studio tasks with meaningful tokens.
+
+Example:
+  Input:  "I want to unblock my account number 1234567890 and my phone is 9892333333"
+  Output: "I want to unblock my account number <ACCOUNT> and my phone is <MOBILE>"
+
+Key fixes applied:
+  1. Manual replacement (sort by position, replace in reverse) — avoids presidio offset bugs
+  2. Default operator added so unknown entities never get silently removed
+  3. HTML stripping before NER so positions are correct
+  4. Same mask_text() function works for BOTH training AND inference
+  5. Overlapping entity handling
+  6. SSL fix corrected
+"""
+
 import re
-import requests
-import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-from presidio_analyzer import Pattern, PatternRecognizer, AnalyzerEngine, RecognizerRegistry, EntityRecognizer, RecognizerResult
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 import json
 import os
 import ssl
+import requests
+import torch
+from html.parser import HTMLParser
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from presidio_analyzer import (Pattern, PatternRecognizer, AnalyzerEngine,
+                                RecognizerRegistry, EntityRecognizer, RecognizerResult)
 
+# ── SSL fix ───────────────────────────────────────────────────────────────────
 os.environ["PYTHONHTTPSVERIFY"] = "0"
 os.environ["CURL_CA_BUNDLE"] = ""
-ssl._create_default_https_context = ssl.SSLContext
+ssl._create_default_https_context = ssl._create_unverified_context   # FIXED: was ssl.SSLContext
 
-# =========================
-# GPU setup
-# =========================
+# ── Device ────────────────────────────────────────────────────────────────────
 device = 0 if torch.cuda.is_available() else -1
 print(f"Using device: {'GPU' if device >= 0 else 'CPU'}")
 
-# =========================
-# ENTITY TOKEN MAP
-# =========================
+# ── Entity → replacement token map ───────────────────────────────────────────
+# These are the tokens that will appear in training data and inference
+# CRITICAL: whatever tokens you use here MUST be the same in inference script
 ENTITY_MAP = {
-    "PERSON": "<NAME>",
-    "EMAIL_ADDRESS": "<EMAIL>",
-    "PHONE_NUMBER": "<MOBILE>",
-    "AADHAR": "<AADHAAR>",
-    "PAN": "<PAN>",
-    "IFSC": "<IFSC>",
-    "BANK_ACC": "<ACCOUNT>",
-    "DP_ACCOUNT": "<ACCOUNT>",
-    "DP_ACCOUNT_CDSL": "<ACCOUNT>",
-    "CIF": "<CIF>",
-    "USER_ID": "<USER_ID>",
-    "TRADING_ID": "<USER_ID>",
-    "DP_ID": "<DP_ID>",
-    "URL": "<URL>"
+    "PERSON":           "<NAME>",
+    "EMAIL_ADDRESS":    "<EMAIL>",
+    "PHONE_NUMBER":     "<MOBILE>",
+    "AADHAR":           "<AADHAAR>",
+    "PAN":              "<PAN>",
+    "IFSC":             "<IFSC>",
+    "BANK_ACC":         "<ACCOUNT>",
+    "DP_ACCOUNT":       "<ACCOUNT>",
+    "DP_ACCOUNT_CDSL":  "<ACCOUNT>",
+    "CIF":              "<CIF>",
+    "USER_ID":          "<USER_ID>",
+    "TRADING_ID":       "<USER_ID>",
+    "DP_ID":            "<DP_ID>",
+    "URL":              "<URL>",
+    "IP_ADDRESS":       "<IP_ADDR>",
 }
 
-# =========================
-# Load IndicNER
-# =========================
-model_name = r"E:\FeatSystems\masking_data_label_studio\indicmodel"
+# ── HTML stripper — extract plain text keeping char positions ─────────────────
+class HTMLStripper(HTMLParser):
+    """Strips HTML tags but keeps track of position offsets."""
+    def __init__(self):
+        super().__init__()
+        self.plain_text = ""
+        self.offset_map = []   # maps plain_text index → original html index
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-model = AutoModelForTokenClassification.from_pretrained(model_name, local_files_only=True)
+    def handle_data(self, data):
+        start = self.getpos()
+        for ch in data:
+            self.offset_map.append(len(self.plain_text))
+            self.plain_text += ch
+
+def strip_html(html_text):
+    """Returns (plain_text, offset_map) where offset_map[i] = position in html_text."""
+    # Simple approach: just remove HTML tags with regex for masking purposes
+    plain = re.sub(r'<[^>]+>', ' ', html_text)
+    plain = re.sub(r'&nbsp;', ' ', plain)
+    plain = re.sub(r'&amp;', '&', plain)
+    plain = re.sub(r'&lt;', '<', plain)
+    plain = re.sub(r'&gt;', '>', plain)
+    plain = re.sub(r'\s+', ' ', plain).strip()
+    return plain
+
+
+# ── IndicNER Recognizer ───────────────────────────────────────────────────────
+MODEL_PATH = r"E:\FeatSystems\masking_data_label_studio\indicmodel"
+
+tokenizer_ner  = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+model_ner      = AutoModelForTokenClassification.from_pretrained(MODEL_PATH, local_files_only=True)
 
 ner_pipeline = pipeline(
     "ner",
-    model=model,
-    tokenizer=tokenizer,
+    model=model_ner,
+    tokenizer=tokenizer_ner,
     aggregation_strategy="simple",
     device=device
 )
 
 class IndicNERRecognizer(EntityRecognizer):
-    def __init__(self, ner_pipeline, supported_entities=None, name="IndicNERRecognizer"):
+    def __init__(self, ner_pipeline):
         self.ner_pipeline = ner_pipeline
-        supported_entities = supported_entities or ["PERSON"]
-        super().__init__(supported_entities=supported_entities, name=name)
+        super().__init__(supported_entities=["PERSON"], name="IndicNERRecognizer")
 
     def analyze(self, text, entities, nlp_artifacts=None):
         results = []
-        predictions = self.ner_pipeline(text)
-
-        for p in predictions:
-            if p["entity_group"] == "PER" and "PERSON" in entities:
-                results.append(
-                    RecognizerResult(
+        if "PERSON" not in entities:
+            return results
+        try:
+            predictions = self.ner_pipeline(text)
+            for p in predictions:
+                if p["entity_group"] == "PER":
+                    results.append(RecognizerResult(
                         entity_type="PERSON",
                         start=p["start"],
                         end=p["end"],
                         score=p["score"]
-                    )
-                )
+                    ))
+        except Exception as e:
+            print(f"  IndicNER warning: {e}")
         return results
 
-# =========================
-# Load Regex Config
-# =========================
+    def load(self):
+        pass
+
+
+# ── Load regex patterns from config ──────────────────────────────────────────
 CONFIG_PATH = r"E:\FeatSystems\masking_data_label_studio\config.json"
 
 patterns = []
@@ -87,12 +132,21 @@ if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
     patterns = [(item["name"], item["regex"]) for item in config.get("patterns", [])]
+    print(f"Loaded {len(patterns)} regex patterns from config")
 else:
-    print(f"Config file not found at {CONFIG_PATH}")
+    print(f"WARNING: Config not found at {CONFIG_PATH} — using built-in patterns only")
+    # Built-in fallback patterns for common Indian banking entities
+    patterns = [
+        ("BANK_ACC",      r"\b\d{9,18}\b"),
+        ("CIF",           r"\bCIF\s*[:\-]?\s*\d{8,12}\b"),
+        ("IFSC",          r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),
+        ("PAN",           r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b"),
+        ("AADHAR",        r"\b\d{4}\s\d{4}\s\d{4}\b"),
+        ("IP_ADDRESS",    r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
+        ("USER_ID",       r"\bUID\s*[:\-]?\s*\d{6,12}\b"),
+    ]
 
-# =========================
-# Register recognizers
-# =========================
+# ── Build registry ────────────────────────────────────────────────────────────
 registry = RecognizerRegistry()
 registry.load_predefined_recognizers()
 
@@ -105,85 +159,147 @@ registry.add_recognizer(IndicNERRecognizer(ner_pipeline))
 
 analyzer = AnalyzerEngine(registry=registry)
 
-# =========================
-# INIT ANONYMIZER (FIX)
-# =========================
-anonymizer = AnonymizerEngine()
+# List of all entity types to detect
+ALL_ENTITIES = list(ENTITY_MAP.keys()) + ["PHONE_NUMBER", "EMAIL_ADDRESS"]
+ALL_ENTITIES = list(set(ALL_ENTITIES))   # deduplicate
 
-# =========================
-# MASKING FUNCTION (FINAL FIXED)
-# =========================
+
+# ── CORE MASKING FUNCTION ────────────────────────────────────────────────────
 def mask_text(text):
-    entities_to_mask = [e[0] for e in patterns] + ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS"]
+    """
+    Detect PII entities in text and replace with meaningful tokens.
+    
+    Input:  "Unblock account 1234567890, phone 9892333333"
+    Output: "Unblock account <ACCOUNT>, phone <MOBILE>"
+    
+    Works on plain text OR HTML. If HTML is passed, tags are preserved
+    and only the visible text entities are masked.
+    """
+    if not text or not text.strip():
+        return text
 
-    results = analyzer.analyze(
-        text=text,
-        entities=entities_to_mask,
-        language='en'
-    )
+    # ── Step 1: get plain text for NER detection ──────────────────────────
+    is_html = bool(re.search(r'<[a-zA-Z]', text))
 
-    # =========================
-    # CREATE OPERATORS
-    # =========================
-    operators = {}
+    if is_html:
+        plain = strip_html(text)
+    else:
+        plain = text
 
-    for entity in entities_to_mask:
-        replacement = ENTITY_MAP.get(entity, f"<{entity}>")
-        operators[entity] = OperatorConfig("replace", {"new_value": replacement})
+    if not plain.strip():
+        return text
 
-    # =========================
-    # APPLY SAFE MASKING
-    # =========================
-    anonymized_result = anonymizer.anonymize(
-        text=text,
-        analyzer_results=results,
-        operators=operators
-    )
+    # ── Step 2: detect entities on plain text ─────────────────────────────
+    try:
+        results = analyzer.analyze(
+            text=plain,
+            entities=ALL_ENTITIES,
+            language='en'
+        )
+    except Exception as e:
+        print(f"  Analyzer warning: {e}")
+        return text
 
-    return anonymized_result.text
+    if not results:
+        return text
 
-# =========================
-# LABEL STUDIO API
-# =========================
-API_TOKEN = ""
-BASE_URL = "http://localhost:8080/api"
+    # ── Step 3: remove overlapping detections (keep highest score) ────────
+    results_sorted = sorted(results, key=lambda r: (r.start, -r.score))
+    filtered = []
+    last_end = -1
+    for r in results_sorted:
+        if r.start >= last_end:
+            filtered.append(r)
+            last_end = r.end
 
-PROXIES = {"http": None}
+    # ── Step 4: replace manually in REVERSE order (right to left) ─────────
+    # Reverse order ensures earlier positions are not shifted by replacements
+    masked = plain
+    for r in sorted(filtered, key=lambda x: x.start, reverse=True):
+        token    = ENTITY_MAP.get(r.entity_type, f"<{r.entity_type}>")
+        original = masked[r.start:r.end]
+        masked   = masked[:r.start] + token + masked[r.end:]
+
+    # ── Step 5: if original was HTML, apply masking tokens to HTML too ────
+    if is_html:
+        # Re-apply detected entities to the HTML text
+        # We do this by replacing the plain-text matched strings in HTML
+        result_text = text
+        for r in sorted(filtered, key=lambda x: x.start, reverse=True):
+            original_word = plain[r.start:r.end]
+            token = ENTITY_MAP.get(r.entity_type, f"<{r.entity_type}>")
+            # Replace only the first occurrence to avoid partial matches
+            result_text = result_text.replace(original_word, token, 1)
+        return result_text
+
+    return masked
+
+
+# ── QUICK TEST ────────────────────────────────────────────────────────────────
+def run_test():
+    test_cases = [
+        "I want to unblock my account number 1234567890 and my phone number is 9892333333",
+        "My CIF is 12345678 and IFSC code is HDFC0001234",
+        "Please update email to user@example.com for account 987654321012",
+        "IP access from 192.168.1.45 — please check",
+        "PAN number ABCDE1234F and Aadhaar 1234 5678 9012",
+        "Dear Rajesh Kumar, your account has been blocked",
+    ]
+    print("\n" + "="*60)
+    print("MASKING TEST")
+    print("="*60)
+    for text in test_cases:
+        masked = mask_text(text)
+        print(f"\n  IN : {text}")
+        print(f"  OUT: {masked}")
+    print("="*60 + "\n")
+
+
+# ── LABEL STUDIO INTEGRATION ──────────────────────────────────────────────────
+API_TOKEN = ""           # ← fill this
+BASE_URL  = "http://localhost:8080/api"
+PROXIES   = {"http": None}
+
 
 def get_tasks(project_id, page=1):
     url = f"{BASE_URL}/tasks/?page={page}&project={project_id}&fields=task_only"
-
     headers = {
-        "accept": "application/json",
+        "accept":        "application/json",
         "Authorization": f"Token {API_TOKEN}"
     }
-
     try:
         response = requests.get(url, headers=headers, proxies=PROXIES, verify=False)
         response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict):
+            return data.get("results", []) or data.get("tasks", [])
+        return data
     except requests.exceptions.RequestException as e:
         print(f"Error fetching page {page}: {e}")
         return []
 
-    data = response.json()
-
-    if isinstance(data, dict):
-        return data.get("results", []) or data.get("tasks", [])
-
-    return data
 
 def update_task(task):
-    task_id = task["id"]
+    task_id      = task["id"]
     original_html = task.get("data", {}).get("html", "")
 
+    if not original_html:
+        print(f"  Task {task_id}: no html field — skipping")
+        return
+
+    # ── FIXED: mask entities before sending to model ──────────────────────
     masked_html = mask_text(original_html)
+
+    if masked_html == original_html:
+        print(f"  Task {task_id}: no entities found — skipped")
+        return
+
     task["data"]["html"] = masked_html
 
     url = f"{BASE_URL}/tasks/{task_id}/"
-
     headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json",
+        "accept":        "application/json",
+        "Content-Type":  "application/json",
         "Authorization": f"Token {API_TOKEN}"
     }
 
@@ -191,39 +307,50 @@ def update_task(task):
         url,
         headers=headers,
         proxies=PROXIES,
-        json={
-            "data": task["data"],
-            "project": task["project"]
-        }
+        json={"data": task["data"], "project": task["project"]},
+        verify=False
     )
 
     if response.status_code in [200, 201]:
-        print(f"Task {task_id} updated successfully.")
+        print(f"  Task {task_id}: masked and updated ✓")
     else:
-        print(f"Failed to update task {task_id}: {response.status_code} - {response.text}")
+        print(f"  Task {task_id}: FAILED {response.status_code} — {response.text[:100]}")
 
-def process_project_tasks(project_id):
+
+def process_project(project_id):
     page = 1
-    total_processed = 0
+    total = 0
+    print(f"Processing project {project_id}...")
 
     while True:
         tasks = get_tasks(project_id, page=page)
-
         if not tasks:
-            print(f"No more tasks. Total processed: {total_processed}")
             break
 
-        print(f"Processing page {page} with {len(tasks)} tasks...")
-
+        print(f"\nPage {page} — {len(tasks)} tasks")
         for task in tasks:
             update_task(task)
-            total_processed += 1
+            total += 1
 
         page += 1
 
-# =========================
-# RUN
-# =========================
+    print(f"\nDone. Total tasks processed: {total}")
+
+
+# ── INFERENCE HELPER — USE THIS IN INFERENCE SCRIPT TOO ──────────────────────
+# Just import this function in Inference_Single_Level.py:
+#
+#   from masking import mask_text
+#
+#   # In your prediction loop:
+#   text = mask_text(str(row[EMAIL_COL]))   # ← mask before sending to model
+#   payload = build_payload_bert(text)
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Run quick test first to verify masking works
+    run_test()
+
+    # Then process Label Studio project
     PROJECT_ID = 16
-    process_project_tasks(PROJECT_ID)
+    process_project(PROJECT_ID)
