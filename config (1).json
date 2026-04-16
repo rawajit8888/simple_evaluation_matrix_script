@@ -1,0 +1,59 @@
+{
+  "patterns": [
+    {
+      "name": "DP_ACCOUNT",
+      "regex": "\\b\\d{8}\\b",
+      "comment": "8-digit DP account number"
+    },
+    {
+      "name": "DP_ID",
+      "regex": "\\bIN\\s*\\d{6,}\\b",
+      "comment": "DP ID starting with IN followed by digits"
+    },
+    {
+      "name": "TRADING_ID",
+      "regex": "(?<!\\d)\\d{6,7}(?!\\d)",
+      "comment": "FIX-3: 6-7 digit trading client ID — negative lookaround prevents matching inside longer numbers"
+    },
+    {
+      "name": "PAN",
+      "regex": "\\b[A-Z]{5}[0-9]{4}[A-Z]{1}\\b",
+      "comment": "PAN card number — 5 letters, 4 digits, 1 letter"
+    },
+    {
+      "name": "DP_ACCOUNT_CDSL",
+      "regex": "\\b(?:\\d\\s*){16}\\b",
+      "comment": "FIX-4: 16-digit CDSL DP account — added leading \\b to prevent mid-number false matches"
+    },
+    {
+      "name": "BANK_ACC",
+      "regex": "\\b\\d{9,18}\\b",
+      "comment": "FIX-2: Bank account number 9-18 digits — was \\b\\d{14}\\b which missed 11-digit accounts"
+    },
+    {
+      "name": "AADHAR",
+      "regex": "\\b(?:\\d\\s*){12}\\b",
+      "comment": "FIX-4: 12-digit Aadhaar — added leading \\b to prevent mid-number false matches"
+    },
+    {
+      "name": "IFSC",
+      "regex": "\\b[A-Z]{4}0[A-Z0-9]{6}\\b",
+      "comment": "IFSC code — 4 letters, 0, 6 alphanumeric"
+    },
+    {
+      "name": "CIF",
+      "regex": "\\b(?:CIF|cif)\\s*(?:no\\.?|number|#)?\\s*[:\\-]?\\s*\\d{8,12}\\b",
+      "comment": "CIF number — supports: CIF 12345678, CIF: 12345678, CIF no. 12345678"
+    },
+    {
+      "name": "CORP_ID",
+      "regex": "\\b(?:CORP\\s*(?:ID)?|corp\\s*(?:id)?)\\s*[:\\-#]?\\s*[A-Z0-9]{4,12}\\b",
+      "comment": "Corporate ID — supports: CORP ID ABC123, CORP: XYZ001, CORPID AB9988"
+    },
+    {
+      "name": "USER_ID",
+      "regex": "\\b(?:USER\\s*ID|user\\s*id|UID|uid)\\s*[:\\-#]?\\s*[A-Z0-9]{4,12}\\b",
+      "comment": "User ID — supports: USER ID U12345, UID: 456789, userid uid112233"
+    }
+  ]
+}
