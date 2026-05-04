@@ -1,0 +1,25 @@
+SELECT
+DB NAME(database_id) AS DatabaseName,
+CAST(
+SUM(CASE WHEN type_desc - 'ROWS' THEN size END) 8.0 / 1024
+AS DECIMAL(10, 2)
+) AS DataSizeMB, -- Data files size
+CAST(
+SUM(CASE WHEN type_desc - 'LOG' THEN size END) * 8.0 / 1024
+AS DECIMAL(10, 2)
+) AS LogsizeMB, -- Transaction log files size
+CAST(
+SUN(size) "8.0 /1024
+AS DECIMAL(10, 2)
+) AS TotalSizeMB -- Total size of all files
+FROM
+sys.master_files
+WHERE
+database_id > 4 -- Excludes system databases (master, model, msdb, tempdb)
+GROUP BY
+database_id
+ORDER BY
+CAST (
+SUN(CASE WHEN type_desc W 'LOG' THEN size END) I 8.0/1024
+AS DECIMAL(10, 2)
+)Desc
